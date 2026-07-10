@@ -1,0 +1,18 @@
+[package]
+name = "hypertron-transfer"
+description = "Hypertron Privacy Protocol — confidential transfer (composes commitment, nullifier, verifier)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+hypertron-commitment = { path = "../commitment" }
+hypertron-nullifier = { path = "../nullifier" }

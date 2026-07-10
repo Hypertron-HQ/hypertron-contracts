@@ -1,0 +1,19 @@
+[package]
+name = "merchant-settlement"
+description = "Reference consumer: merchant confidential settlement built on the public Hypertron API"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+hypertron-transfer = { path = "../../contracts/transfer" }
+hypertron-commitment = { path = "../../contracts/commitment" }
+hypertron-nullifier = { path = "../../contracts/nullifier" }

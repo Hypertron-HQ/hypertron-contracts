@@ -1,0 +1,16 @@
+[package]
+name = "hypertron-nullifier"
+description = "Hypertron Privacy Protocol — nullifier registry (double-spend prevention)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }

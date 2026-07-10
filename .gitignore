@@ -1,0 +1,9 @@
+# Rust build artifacts
+/target
+
+# Third-party reference material (studied, not distributed)
+/reference
+
+# OS / editor cruft
+.DS_Store
+**/*.rs.bk
