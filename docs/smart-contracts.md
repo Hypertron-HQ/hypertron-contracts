@@ -129,6 +129,26 @@ change the amount.
 - Imports `hypertron-transfer` (+ `verifier`) through the **public crate API only** — no internal shortcut.
 - Thin TypeScript UI + prover harness on top; all privacy/settlement logic lives in the contracts.
 
+### 2.6 `prover` — Off-chain prover + CLI (`hypertron-prove`)
+
+**Job:** let integrators generate proofs and verifying keys outside the test
+suite. This crate is the **canonical, single source** of the circuit and the
+Groth16 tooling — `contracts/verifier`'s tests depend on this exact code, so what
+you prove with the CLI is what the chain verifies. It is a native `std` crate and
+is excluded from the wasm `default-members`.
+
+```text
+setup      -> pk.bin + vk.json          (register vk.json on-chain once)
+leaf       -> Poseidon(n, k)            (the commitment you deposit)
+nullifier  -> Poseidon(n, 0)
+prove      -> proof.json { proof, public_inputs=[root, nullifier, recipient, amount] }
+```
+
+The `prove` command rebuilds the Merkle path from the ordered tree leaves, binds
+the payout, and self-verifies the proof before emitting it. Note: `setup` is a
+local deterministic setup for dev/test — production requires a proper multi-party
+trusted-setup ceremony.
+
 ---
 
 ## 3. How a payment flows through the contracts

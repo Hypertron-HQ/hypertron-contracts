@@ -8,7 +8,7 @@ fn leaf(env: &Env, n: u8) -> BytesN<32> {
     BytesN::from_array(env, &a)
 }
 
-fn setup(env: &Env) -> (CommitmentContractClient, Address) {
+fn setup(env: &Env) -> (CommitmentContractClient<'_>, Address) {
     let id = env.register(CommitmentContract, ());
     let client = CommitmentContractClient::new(env, &id);
     let authority = Address::generate(env);

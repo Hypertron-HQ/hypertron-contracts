@@ -6,6 +6,17 @@ members = [
     "contracts/verifier",
     "contracts/transfer",
     "examples/merchant-settlement",
+    "prover",
+]
+# The prover is a native std crate (arkworks + CLI); it must NOT be part of the
+# default set so `cargo build --target wasm32v1-none` only compiles the
+# contracts. Build/test it explicitly with `-p hypertron-prover`.
+default-members = [
+    "contracts/commitment",
+    "contracts/nullifier",
+    "contracts/verifier",
+    "contracts/transfer",
+    "examples/merchant-settlement",
 ]
 
 [workspace.package]

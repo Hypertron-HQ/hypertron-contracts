@@ -1,0 +1,35 @@
+[package]
+name = "hypertron-prover"
+description = "Hypertron Privacy Protocol — off-chain Groth16 prover + CLI for the shielded-pool membership circuit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "hypertron_prover"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hypertron-prove"
+path = "src/main.rs"
+
+[dependencies]
+# Same arkworks 0.4.x stack (and serialization) the Soroban host uses, so the
+# proofs / verifying keys this crate emits are byte-identical to what the
+# on-chain verifier expects.
+ark-bls12-381 = "0.4"
+ark-ec = "0.4"
+ark-ff = "0.4"
+ark-groth16 = { version = "0.4", default-features = false }
+ark-relations = "0.4"
+ark-r1cs-std = "0.4"
+ark-serialize = "0.4"
+ark-snark = "0.4"
+ark-std = "0.4"
+
+# CLI + IO.
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

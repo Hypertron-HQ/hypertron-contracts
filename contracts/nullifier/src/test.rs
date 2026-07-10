@@ -8,7 +8,7 @@ fn nf(env: &Env, n: u8) -> BytesN<32> {
     BytesN::from_array(env, &a)
 }
 
-fn setup(env: &Env) -> NullifierContractClient {
+fn setup(env: &Env) -> NullifierContractClient<'_> {
     let id = env.register(NullifierContract, ());
     let client = NullifierContractClient::new(env, &id);
     client.initialize(&Address::generate(env));

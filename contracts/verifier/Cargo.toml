@@ -26,6 +26,10 @@ ark-r1cs-std = "0.4"
 ark-serialize = "0.4"
 ark-snark = "0.4"
 ark-std = "0.4"
+# The canonical circuit + Groth16 prover. The on-chain tests prove with the
+# SAME crate integrators use via the `hypertron-prove` CLI, so what we verify
+# here is exactly what the chain verifies in production.
+hypertron-prover = { path = "../../prover" }
 # Used to cross-check that our in-circuit Poseidon matches the on-chain host,
 # and to prove membership against the real on-chain commitment tree.
 soroban-poseidon = "25.0"
