@@ -18,7 +18,7 @@ fn dummy_vk(env: &Env, n_pub: u32) -> VerifyingKey {
     }
 }
 
-fn setup(env: &Env) -> VerifierContractClient {
+fn setup(env: &Env) -> VerifierContractClient<'_> {
     let id = env.register(VerifierContract, ());
     let client = VerifierContractClient::new(env, &id);
     client.initialize(&Address::generate(env));

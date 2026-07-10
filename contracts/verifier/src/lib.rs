@@ -175,3 +175,9 @@ mod test;
 
 #[cfg(test)]
 mod e2e_test;
+
+#[cfg(test)]
+mod poseidon_gate;
+
+#[cfg(test)]
+mod circuit;

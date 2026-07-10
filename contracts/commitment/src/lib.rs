@@ -11,8 +11,10 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractevent, contracterror, contractimpl, contracttype, Bytes, BytesN, Env, Vec,
+    contract, contractevent, contracterror, contractimpl, contracttype,
+    crypto::bls12_381::Fr as BlsScalar, Bytes, BytesN, Env, Vec, U256,
 };
+use soroban_poseidon::poseidon_hash;
 
 /// Emitted when a note commitment is inserted into the tree.
 #[contractevent]
@@ -79,9 +81,9 @@ impl CommitmentContract {
             return Err(Error::AlreadyInitialized);
         }
 
-        // Build the zero-subtree hashes bottom-up from a domain-separated base.
-        let base = env.crypto().keccak256(&Bytes::from_slice(&env, b"hypertron:empty-leaf"));
-        let base: BytesN<32> = base.into();
+        // Empty leaf is the field-element zero, so on-chain hashing matches the
+        // ZK circuit's zero-leaf convention.
+        let base: BytesN<32> = BytesN::from_array(&env, &[0u8; 32]);
 
         let mut zeros = Vec::new(&env);
         let mut filled = Vec::new(&env);
@@ -198,12 +200,26 @@ impl CommitmentContract {
     }
 }
 
-/// Hash two child nodes into their parent. Swap point for Poseidon2 (CAP-0075).
+/// Hash two child nodes into their parent using circom-compatible Poseidon
+/// over BLS12-381 (CAP-0075), so on-chain roots match the ZK membership circuit.
 fn hash_pair(env: &Env, left: &BytesN<32>, right: &BytesN<32>) -> BytesN<32> {
-    let mut buf = Bytes::new(env);
-    buf.append(&Bytes::from_array(env, &left.to_array()));
-    buf.append(&Bytes::from_array(env, &right.to_array()));
-    env.crypto().keccak256(&buf).into()
+    let mut inputs: Vec<U256> = Vec::new(env);
+    inputs.push_back(bytesn_to_u256(env, left));
+    inputs.push_back(bytesn_to_u256(env, right));
+    let out = poseidon_hash::<3, BlsScalar>(env, &inputs);
+    u256_to_bytesn(env, &out)
+}
+
+fn bytesn_to_u256(env: &Env, b: &BytesN<32>) -> U256 {
+    U256::from_be_bytes(env, &Bytes::from_array(env, &b.to_array()))
+}
+
+fn u256_to_bytesn(env: &Env, v: &U256) -> BytesN<32> {
+    let bytes = v.to_be_bytes();
+    let len = bytes.len();
+    let mut buf = [0u8; 32];
+    bytes.copy_into_slice(&mut buf[(32 - len as usize)..]);
+    BytesN::from_array(env, &buf)
 }
 
 #[cfg(test)]
