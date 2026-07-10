@@ -119,7 +119,6 @@ fn full_withdraw_pays_recipient_and_attests() {
         &leaf(&h.env, 9), // nullifier
         &recipient,
         &50,
-        &Vec::new(&h.env),
         &ok_claim(),
     );
 
@@ -143,7 +142,7 @@ fn double_spend_is_rejected() {
     let nf = leaf(&h.env, 9);
 
     h.client
-        .withdraw(&proof, &root, &nf, &recipient, &10, &Vec::new(&h.env), &ok_claim());
+        .withdraw(&proof, &root, &nf, &recipient, &10, &ok_claim());
 
     let res = h.client.try_withdraw(
         &proof,
@@ -151,7 +150,6 @@ fn double_spend_is_rejected() {
         &nf,
         &recipient,
         &10,
-        &Vec::new(&h.env),
         &ok_claim(),
     );
     assert!(res.is_err());
@@ -170,7 +168,6 @@ fn unknown_root_is_rejected() {
         &leaf(&h.env, 9),
         &recipient,
         &10,
-        &Vec::new(&h.env),
         &ok_claim(),
     );
     assert!(res.is_err());
@@ -194,7 +191,6 @@ fn invalid_proof_is_rejected() {
         &leaf(&h.env, 9),
         &recipient,
         &10,
-        &Vec::new(&h.env),
         &ok_claim(),
     );
     assert!(res.is_err());
@@ -218,7 +214,6 @@ fn timing_claim_is_rejected() {
         &leaf(&h.env, 9),
         &recipient,
         &10,
-        &Vec::new(&h.env),
         &claim,
     );
     assert!(res.is_err());

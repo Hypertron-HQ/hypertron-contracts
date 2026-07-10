@@ -876,6 +876,8 @@ dependencies = [
  "ark-snark",
  "ark-std",
  "hypertron-commitment",
+ "hypertron-nullifier",
+ "hypertron-transfer",
  "soroban-poseidon",
  "soroban-sdk",
 ]

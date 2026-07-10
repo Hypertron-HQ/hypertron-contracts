@@ -14,8 +14,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contractevent, contracterror, contractimpl, contracttype, token,
-    Address, Bytes, BytesN, Env, Vec,
+    contract, contractclient, contractevent, contracterror, contractimpl, contracttype,
+    token, xdr::ToXdr, Address, Bytes, BytesN, Env, Vec,
 };
 
 /// Cross-contract interfaces. We call components through generated clients
@@ -173,7 +173,6 @@ impl TransferContract {
         nullifier: BytesN<32>,
         recipient: Address,
         amount: i128,
-        public_inputs: Vec<BytesN<32>>,
         claim: PrivacyLevel,
     ) -> Result<PrivacyAttestation, Error> {
         // ---- validation phase (no state changes) ----
@@ -196,6 +195,17 @@ impl TransferContract {
         if nullifiers.is_spent(&nullifier) {
             return Err(Error::NullifierAlreadySpent);
         }
+
+        // The public inputs are DERIVED from the actual payout parameters, so
+        // the proof is cryptographically bound to this exact (root, nullifier,
+        // recipient, amount). A relayer cannot redirect funds or change the
+        // amount without invalidating the proof.
+        // Order must match the circuit: [root, nullifier, recipient, amount].
+        let mut public_inputs: Vec<BytesN<32>> = Vec::new(&env);
+        public_inputs.push_back(root.clone());
+        public_inputs.push_back(nullifier.clone());
+        public_inputs.push_back(recipient_field(&env, &recipient));
+        public_inputs.push_back(amount_field(&env, amount));
 
         let verifier = VerifierClient::new(&env, &cfg.verifier);
         if !verifier.verify(&cfg.vk_id, &proof, &public_inputs) {
@@ -242,6 +252,23 @@ fn load_config(env: &Env) -> Result<Config, Error> {
         .instance()
         .get(&Key::Config)
         .ok_or(Error::NotInitialized)
+}
+
+/// Deterministically map a recipient `Address` to a BLS12-381 field element,
+/// as `sha256(xdr(address))`. The verifier host reduces the 32 bytes modulo the
+/// scalar field, so the prover binds the same value with
+/// `Fr::from_be_bytes_mod_order(sha256(xdr(address)))`.
+fn recipient_field(env: &Env, recipient: &Address) -> BytesN<32> {
+    let xdr = recipient.clone().to_xdr(env);
+    env.crypto().sha256(&xdr).to_bytes()
+}
+
+/// Encode a positive `amount` as a big-endian field element (right-aligned in
+/// 32 bytes). The prover binds `Fr::from(amount as u128)`.
+fn amount_field(env: &Env, amount: i128) -> BytesN<32> {
+    let mut buf = [0u8; 32];
+    buf[16..32].copy_from_slice(&amount.to_be_bytes());
+    BytesN::from_array(env, &buf)
 }
 
 #[cfg(test)]

@@ -30,3 +30,7 @@ ark-std = "0.4"
 # and to prove membership against the real on-chain commitment tree.
 soroban-poseidon = "25.0"
 hypertron-commitment = { path = "../commitment" }
+# Pulled in only for the end-to-end integration test that drives a real proof
+# through the full shielded-pool deposit -> withdraw flow.
+hypertron-nullifier = { path = "../nullifier" }
+hypertron-transfer = { path = "../transfer" }

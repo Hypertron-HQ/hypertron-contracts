@@ -9,7 +9,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, Bytes, BytesN,
-    Env, Vec,
+    Env,
 };
 
 /// Public interface of the Hypertron shielded pool, called through a generated
@@ -24,7 +24,6 @@ pub trait PoolApi {
         nullifier: BytesN<32>,
         recipient: Address,
         amount: i128,
-        public_inputs: Vec<BytesN<32>>,
         claim: PrivacyLevel,
     ) -> PrivacyAttestation;
 }
@@ -97,7 +96,6 @@ impl MerchantSettlement {
         root: BytesN<32>,
         nullifier: BytesN<32>,
         amount: i128,
-        public_inputs: Vec<BytesN<32>>,
         claim: PrivacyLevel,
     ) -> Result<PrivacyAttestation, Error> {
         let pool: Address = env.storage().instance().get(&Key::Pool).ok_or(Error::NotInitialized)?;
@@ -109,7 +107,6 @@ impl MerchantSettlement {
             &nullifier,
             &merchant,
             &amount,
-            &public_inputs,
             &claim,
         ))
     }

@@ -108,10 +108,17 @@ pub trait ConfidentialTransfer {
         root: BytesN<32>,
         nullifier: BytesN<32>,
         recipient: Address,
-        // + the Privacy Attestation, see section 4
-    );
+        amount: i128,
+        claim: PrivacyLevel,
+    ) -> PrivacyAttestation; // see section 4
 }
 ```
+
+The circuit's public inputs are `[root, nullifier, recipient, amount]`. `withdraw`
+**derives** the `recipient`/`amount` field elements itself (from the real payout
+args) rather than trusting caller-supplied values, so a valid proof is
+cryptographically bound to this exact payout — a relayer cannot redirect funds or
+change the amount.
 
 **This is where the modules snap together** — it imports the public API of the other three, exactly like an external developer would.
 

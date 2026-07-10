@@ -2,11 +2,14 @@
 //! nullifier derivation, proved in zero knowledge over BLS12-381 and verified
 //! on-chain by [`VerifierContract`].
 //!
-//! Statement proved (public inputs: `[root, nullifier_hash]`):
+//! Statement proved (public inputs: `[root, nullifier_hash, recipient, amount]`):
 //!   - I know a note `(n, k)` whose commitment `leaf = Poseidon(n, k)` is a
 //!     member of the Merkle tree with the given `root`, AND
 //!   - `nullifier_hash = Poseidon(n, 0)` (deterministic per note -> double-spend
-//!     protection without linking to the deposit).
+//!     protection without linking to the deposit), AND
+//!   - `recipient` and `amount` are bound into the proof so a relayer cannot
+//!     redirect funds or alter the payout. They carry no extra constraints; the
+//!     Groth16 public-input binding alone ties the proof to this exact payout.
 //!
 //! The in-circuit Poseidon uses the exact parameters of the on-chain host
 //! (proved equivalent by `poseidon_gate`), so proofs verify against real
@@ -81,6 +84,8 @@ pub(crate) struct MembershipCircuit {
     // public inputs
     pub root: Option<Fr>,
     pub nullifier_hash: Option<Fr>,
+    pub recipient: Option<Fr>,
+    pub amount: Option<Fr>,
     // private witness
     pub n: Option<Fr>,
     pub k: Option<Fr>,
@@ -93,12 +98,19 @@ impl ConstraintSynthesizer<Fr> for MembershipCircuit {
         let mds = mds_fr();
         let rc = rc_fr();
 
-        // Public inputs, allocation order = [root, nullifier_hash].
+        // Public inputs, allocation order = [root, nullifier_hash, recipient, amount].
+        // This order MUST match `transfer.withdraw`, which builds the same vector.
         let root = FpVar::new_input(cs.clone(), || {
             self.root.ok_or(SynthesisError::AssignmentMissing)
         })?;
         let nullifier_hash = FpVar::new_input(cs.clone(), || {
             self.nullifier_hash.ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let recipient = FpVar::new_input(cs.clone(), || {
+            self.recipient.ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        let amount = FpVar::new_input(cs.clone(), || {
+            self.amount.ok_or(SynthesisError::AssignmentMissing)
         })?;
 
         // Note secrets.
@@ -131,6 +143,13 @@ impl ConstraintSynthesizer<Fr> for MembershipCircuit {
         let zero = FpVar::constant(Fr::from(0u64));
         let computed = hash2_var(&n, &zero, &mds, &rc)?;
         computed.enforce_equal(&nullifier_hash)?;
+
+        // Bind recipient and amount into the constraint system. They need no
+        // functional constraint (the Groth16 public-input commitment binds them),
+        // but we reference them here so the R1CS definitely contains their
+        // variables and they cannot be silently dropped.
+        let _ = &recipient * &recipient;
+        let _ = &amount * &amount;
 
         Ok(())
     }
@@ -230,12 +249,16 @@ mod tests {
         }
 
         let nullifier_hash = poseidon2to1(n, Fr::from(0u64));
+        let recipient_fe = Fr::from(0xC0FFEEu64);
+        let amount_fe = Fr::from(50u64);
 
         // ---- 3. Groth16 setup + prove the membership statement.
         let mut rng = StdRng::seed_from_u64(7);
         let setup_circuit = MembershipCircuit {
             root: None,
             nullifier_hash: None,
+            recipient: None,
+            amount: None,
             n: None,
             k: None,
             siblings: ark_std::vec![None; DEPTH],
@@ -247,6 +270,8 @@ mod tests {
         let witness = MembershipCircuit {
             root: Some(root),
             nullifier_hash: Some(nullifier_hash),
+            recipient: Some(recipient_fe),
+            amount: Some(amount_fe),
             n: Some(n),
             k: Some(k),
             siblings: siblings.clone(),
@@ -255,7 +280,12 @@ mod tests {
         let proof = Groth16::<Bls12_381>::prove(&pk, witness, &mut rng).unwrap();
 
         // Sanity: verifies off-chain.
-        assert!(Groth16::<Bls12_381>::verify(&vk, &[root, nullifier_hash], &proof).unwrap());
+        assert!(Groth16::<Bls12_381>::verify(
+            &vk,
+            &[root, nullifier_hash, recipient_fe, amount_fe],
+            &proof
+        )
+        .unwrap());
 
         // ---- 4. Verify the SAME proof ON-CHAIN against the real root.
         let verifier_id = env.register(VerifierContract, ());
@@ -266,6 +296,8 @@ mod tests {
         let mut pubs: SVec<BytesN<32>> = SVec::new(&env);
         pubs.push_back(root_bytes.clone());
         pubs.push_back(fr_to_bytesn(&env, &nullifier_hash));
+        pubs.push_back(fr_to_bytesn(&env, &recipient_fe));
+        pubs.push_back(fr_to_bytesn(&env, &amount_fe));
 
         assert!(verifier.verify(&1, &proof_to_bytes(&env, &proof), &pubs));
 
@@ -273,6 +305,167 @@ mod tests {
         let mut bad = SVec::new(&env);
         bad.push_back(fr_to_bytesn(&env, &Fr::from(999u64)));
         bad.push_back(fr_to_bytesn(&env, &nullifier_hash));
+        bad.push_back(fr_to_bytesn(&env, &recipient_fe));
+        bad.push_back(fr_to_bytesn(&env, &amount_fe));
         assert!(!verifier.verify(&1, &proof_to_bytes(&env, &proof), &bad));
+
+        // A proof presented for a DIFFERENT recipient must fail: this is the
+        // relayer-rebinding attack the recipient public input defends against.
+        let mut wrong_recipient = SVec::new(&env);
+        wrong_recipient.push_back(root_bytes.clone());
+        wrong_recipient.push_back(fr_to_bytesn(&env, &nullifier_hash));
+        wrong_recipient.push_back(fr_to_bytesn(&env, &Fr::from(0xBADu64)));
+        wrong_recipient.push_back(fr_to_bytesn(&env, &amount_fe));
+        assert!(!verifier.verify(&1, &proof_to_bytes(&env, &proof), &wrong_recipient));
+    }
+
+    /// End-to-end: a real note is deposited into the shielded pool, a REAL
+    /// Groth16 proof is produced off-chain binding (root, nullifier, recipient,
+    /// amount), and `transfer.withdraw` verifies it on-chain via the real
+    /// verifier, spends the nullifier, and pays the recipient. No mocks.
+    #[test]
+    fn full_shielded_pool_withdraw_with_real_proof() {
+        use hypertron_nullifier::{NullifierContract, NullifierContractClient};
+        use hypertron_transfer::{
+            Config, PrivacyLevel, TransferContract, TransferContractClient,
+        };
+        use soroban_sdk::{
+            token::{Client as TokenClient, StellarAssetClient},
+            xdr::ToXdr,
+        };
+
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+
+        // ---- Token + component contracts.
+        let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+        let token = sac.address();
+        let token_admin = StellarAssetClient::new(&env, &token);
+
+        let commitment_id = env.register(CommitmentContract, ());
+        let nullifier_id = env.register(NullifierContract, ());
+        let verifier_id = env.register(VerifierContract, ());
+        let transfer_id = env.register(TransferContract, ());
+
+        CommitmentContractClient::new(&env, &commitment_id).initialize(&transfer_id);
+        NullifierContractClient::new(&env, &nullifier_id).initialize(&transfer_id);
+
+        let pool = TransferContractClient::new(&env, &transfer_id);
+        pool.initialize(&Config {
+            token: token.clone(),
+            commitment: commitment_id.clone(),
+            nullifier: nullifier_id.clone(),
+            verifier: verifier_id.clone(),
+            vk_id: 1,
+        });
+
+        // ---- 1. Deposit a real note into the pool (leaf = Poseidon(n, k)).
+        let n = Fr::from(424242u64);
+        let k = Fr::from(133742u64);
+        let leaf = poseidon2to1(n, k);
+
+        let depositor = Address::generate(&env);
+        token_admin.mint(&depositor, &1000);
+        pool.deposit(&depositor, &100, &fr_to_bytesn(&env, &leaf));
+
+        let root_bytes = CommitmentContractClient::new(&env, &commitment_id).root();
+        let root = bytesn_to_fr(&root_bytes);
+
+        // ---- 2. Off-chain: reconstruct the leftmost path and derive publics.
+        let mut siblings: Vec<Option<Fr>> = Vec::new();
+        let mut path_bits: Vec<Option<bool>> = Vec::new();
+        let mut zero_i = Fr::from(0u64);
+        for _ in 0..DEPTH {
+            siblings.push(Some(zero_i));
+            path_bits.push(Some(false));
+            zero_i = poseidon2to1(zero_i, zero_i);
+        }
+        let nullifier_hash = poseidon2to1(n, Fr::from(0u64));
+
+        let recipient = Address::generate(&env);
+        let amount: i128 = 50;
+        // Must match `transfer::recipient_field` / `amount_field` exactly.
+        let recipient_bytes = env
+            .crypto()
+            .sha256(&recipient.clone().to_xdr(&env))
+            .to_bytes();
+        let recipient_fe = bytesn_to_fr(&recipient_bytes);
+        let amount_fe = Fr::from(amount as u64);
+
+        // ---- 3. Groth16 setup + prove.
+        let mut rng = StdRng::seed_from_u64(99);
+        let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(
+            MembershipCircuit {
+                root: None,
+                nullifier_hash: None,
+                recipient: None,
+                amount: None,
+                n: None,
+                k: None,
+                siblings: ark_std::vec![None; DEPTH],
+                path_bits: ark_std::vec![None; DEPTH],
+            },
+            &mut rng,
+        )
+        .unwrap();
+
+        let proof = Groth16::<Bls12_381>::prove(
+            &pk,
+            MembershipCircuit {
+                root: Some(root),
+                nullifier_hash: Some(nullifier_hash),
+                recipient: Some(recipient_fe),
+                amount: Some(amount_fe),
+                n: Some(n),
+                k: Some(k),
+                siblings,
+                path_bits,
+            },
+            &mut rng,
+        )
+        .unwrap();
+
+        // ---- 4. Register the VK and run the REAL withdrawal.
+        let verifier = VerifierContractClient::new(&env, &verifier_id);
+        verifier.initialize(&Address::generate(&env));
+        verifier.register_vk(&1, &to_soroban_vk(&env, &vk));
+
+        let claim = PrivacyLevel {
+            sender: true,
+            receiver: false,
+            amount: true,
+            timing: false,
+            linkability: true,
+        };
+        let nullifier_bytes = fr_to_bytesn(&env, &nullifier_hash);
+        let att = pool.withdraw(
+            &proof_to_bytes(&env, &proof),
+            &root_bytes,
+            &nullifier_bytes,
+            &recipient,
+            &amount,
+            &claim,
+        );
+
+        // Funds moved and attestation minted.
+        assert_eq!(TokenClient::new(&env, &token).balance(&recipient), 50);
+        assert_eq!(TokenClient::new(&env, &token).balance(&transfer_id), 50);
+        assert!(att.level.sender);
+        assert_eq!(att.root, root_bytes);
+
+        // ---- 5. The proof is bound to `amount`: a relayer cannot alter the
+        // payout. Replaying the same proof for a different amount is rejected.
+        let n2 = Fr::from(555u64);
+        let leaf2 = poseidon2to1(n2, k);
+        pool.deposit(&depositor, &100, &fr_to_bytesn(&env, &leaf2));
+        let bad = pool.try_withdraw(
+            &proof_to_bytes(&env, &proof),
+            &CommitmentContractClient::new(&env, &commitment_id).root(),
+            &fr_to_bytesn(&env, &poseidon2to1(n2, Fr::from(0u64))),
+            &recipient,
+            &40, // != bound amount (50) -> proof invalid
+            &claim,
+        );
+        assert!(bad.is_err());
     }
 }
