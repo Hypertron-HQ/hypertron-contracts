@@ -93,34 +93,63 @@ pub trait ProofVerifier {
 
 ### 2.4 `hypertron-transfer` — Confidential transfer (the composition)
 
-**Job:** the "send a hidden amount" flow, built from the three contracts above. This is the first thing most developers reach for.
+**Job:** the value-committed shielded pool, built from the three contracts above.
 
-- **deposit:** pull tokens in, create a commitment (calls `commitment`).
-- **withdraw / transfer:** accept a proof, verify it (`verifier`), check + spend the nullifier (`nullifier`), pay out.
-- Speaks the standard Soroban token interface (SEP-41) for the underlying asset.
+Notes are **value-committed**: `cm = Poseidon(Poseidon(n,k), v)`. This binds a
+value `v` into every commitment so the pool can enforce conservation in zero
+knowledge (see §2.7). Three flows, each backed by its own verifying key:
+
+- **deposit (shield):** pull tokens in and insert a commitment — but only after a
+  proof that the commitment opens to exactly `amount` (deposit binding), so a
+  transparent deposit cannot mint a note worth more than the tokens paid in.
+- **unshield (exit):** verify membership + nullifier + value balance
+  `v = amount + change`, spend the nullifier, re-insert the change note, pay a
+  public recipient, and attest. Optionally gated by a compliance policy (§2.7).
+- **transfer (fully private):** spend one note → two output notes. NO public
+  recipient address and NO public amount — only the nullifier and two output
+  commitments are on-chain, plus opaque encrypted payloads for discovery.
+
+`unshield` and `transfer` require **no auth from the note owner** — they are
+relayer-submittable, so the fee payer never links to the sender. Speaks SEP-41
+for the underlying asset.
 
 ```rust
 pub trait ConfidentialTransfer {
-    fn deposit(env: &Env, from: Address, amount: i128, commitment: BytesN<32>);
-    fn withdraw(
-        env: &Env,
-        proof: Bytes,
-        root: BytesN<32>,
-        nullifier: BytesN<32>,
-        recipient: Address,
-        amount: i128,
-        claim: PrivacyLevel,
-    ) -> PrivacyAttestation; // see section 4
+    fn deposit(env: &Env, from: Address, amount: i128, commitment: BytesN<32>, deposit_proof: Bytes) -> u32;
+    fn unshield(
+        env: &Env, proof: Bytes, root: BytesN<32>, nullifier: BytesN<32>,
+        recipient: Address, amount: i128, change_commitment: BytesN<32>, claim: PrivacyLevel,
+    ) -> PrivacyAttestation;
+    fn transfer(
+        env: &Env, proof: Bytes, root: BytesN<32>, nullifier: BytesN<32>,
+        out_commitment_1: BytesN<32>, out_commitment_2: BytesN<32>, note_1: Bytes, note_2: Bytes,
+    );
 }
 ```
 
-The circuit's public inputs are `[root, nullifier, recipient, amount]`. `withdraw`
-**derives** the `recipient`/`amount` field elements itself (from the real payout
-args) rather than trusting caller-supplied values, so a valid proof is
-cryptographically bound to this exact payout — a relayer cannot redirect funds or
-change the amount.
+Public inputs per circuit: `deposit = [cm, amount]`,
+`unshield = [root, nullifier, recipient, amount, change_cm]`,
+`transfer = [root, nullifier, out_cm1, out_cm2]`. `unshield` **derives** the
+`recipient`/`amount` field elements itself from the real payout args, so a valid
+proof is bound to this exact payout — a relayer cannot redirect funds or change
+the amount.
 
 **This is where the modules snap together** — it imports the public API of the other three, exactly like an external developer would.
+
+### 2.7 Value conservation, viewing keys, compliance
+
+- **Value conservation + range proofs:** every note value is range-checked to
+  64 bits and the balance equations (`v = amount + change`, `v = v1 + v2`) are
+  enforced in-circuit, so field wraparound cannot mint value. Deposit binding
+  ties the on-chain `amount` to the committed `v`.
+- **Stealth / viewing keys:** the `hypertron-prover` `crypto` module implements
+  ECIES-style note encryption (X25519 + ChaCha20-Poly1305). A recipient
+  publishes a viewing pubkey; senders encrypt `(n,k,v)` to it and the ciphertext
+  rides along the `transfer` event. Recipients (or auditors with the viewing
+  key) scan and decrypt off-chain — read-only disclosure that cannot spend.
+- **Compliance hook (`hypertron-compliance`):** an optional, swappable allow/deny
+  list consulted ONLY at the `unshield` exit. Kept out of the ZK core, so it
+  never weakens privacy and can be replaced or removed via config.
 
 ### 2.5 `examples/merchant-settlement` — Reference consumer
 
@@ -138,33 +167,45 @@ you prove with the CLI is what the chain verifies. It is a native `std` crate an
 is excluded from the wasm `default-members`.
 
 ```text
-setup      -> pk.bin + vk.json          (register vk.json on-chain once)
-leaf       -> Poseidon(n, k)            (the commitment you deposit)
-nullifier  -> Poseidon(n, 0)
-prove      -> proof.json { proof, public_inputs=[root, nullifier, recipient, amount] }
+setup --circuit {deposit|unshield|transfer}  -> pk.bin + vk.json  (register once)
+commitment --n --k --v                        -> cm = Poseidon(Poseidon(n,k), v)
+nullifier  --n                                -> Poseidon(n, 0)
+keygen                                         -> viewing keypair (disclosure)
+deposit-proof                                  -> proof, public=[cm, amount]
+unshield-proof                                 -> proof, public=[root, nf, recipient, amount, change_cm]
+transfer-proof                                 -> proof, public=[root, nf, out_cm1, out_cm2] (+ recipient blob)
+encrypt / decrypt                              -> note payload <-> viewing key
 ```
 
-The `prove` command rebuilds the Merkle path from the ordered tree leaves, binds
-the payout, and self-verifies the proof before emitting it. Note: `setup` is a
-local deterministic setup for dev/test — production requires a proper multi-party
-trusted-setup ceremony.
+The proof commands rebuild the Merkle path from the ordered tree leaves, enforce
+value balance, and self-verify before emitting. Note: `setup` is a local
+deterministic setup for dev/test — production requires the ceremony in
+[ceremony.md](ceremony.md).
 
 ---
 
 ## 3. How a payment flows through the contracts
 
 ```text
-DEPOSIT
-  user ──deposit(amount, commitment)──► transfer
-                                          └─► commitment.insert(leaf)
+DEPOSIT (shield)
+  user ──deposit(amount, cm, deposit_proof)──► transfer
+        ├─► verifier.verify(deposit_proof, [cm, amount])?   (cm opens to amount)
+        └─► commitment.insert(cm)
 
-WITHDRAW / TRANSFER
-  user builds proof off-chain (owns a note, not double-spending, amounts balance)
-  user ──withdraw(proof, root, nullifier, recipient)──► transfer
-        ├─► commitment.contains_root(root)?      (note is in the pool)
-        ├─► verifier.verify(proof, inputs)?       (proof is valid on-chain)
+UNSHIELD (exit, relayer-submittable)
+  user/relayer ──unshield(proof, root, nullifier, recipient, amount, change_cm)──► transfer
+        ├─► compliance.is_allowed(recipient)?      (optional exit policy)
+        ├─► commitment.is_known_root(root)?         (note is in the pool)
+        ├─► verifier.verify(proof, [root, nullifier, recipient, amount, change_cm])?
         ├─► nullifier.is_spent(nullifier)? → mark_spent
+        ├─► commitment.insert(change_cm)            (change stays shielded)
         └─► pay recipient
+
+TRANSFER (fully private, relayer-submittable)
+  user/relayer ──transfer(proof, root, nullifier, out_cm1, out_cm2, ct1, ct2)──► transfer
+        ├─► verifier.verify(proof, [root, nullifier, out_cm1, out_cm2])?  (v_in = v1 + v2)
+        ├─► nullifier.mark_spent(nullifier)
+        └─► commitment.insert(out_cm1); insert(out_cm2)   (no address, no amount)
 ```
 
 ---
