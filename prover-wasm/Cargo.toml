@@ -1,0 +1,37 @@
+[package]
+name = "hypertron-prover-wasm"
+description = "WebAssembly bindings for the Hypertron off-chain prover (browser + Node)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+# cdylib for the wasm artifact; rlib so it can also be built/tested natively.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# The canonical prover, WITHOUT its clap-based CLI (browser builds stay lean).
+hypertron-prover = { path = "../prover", default-features = false }
+
+ark-bls12-381 = "0.4"
+ark-ff = "0.4"
+
+wasm-bindgen = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+# WASM randomness: the `js` feature routes getrandom through the browser/Node
+# crypto API. It is a no-op on native targets.
+getrandom = { version = "0.2", features = ["js"] }
+
+console_error_panic_hook = { version = "0.1", optional = true }
+
+[features]
+default = ["console_error_panic_hook"]
+
+[package.metadata.wasm-pack.profile.release]
+# Keep the wasm small; arkworks + BLS is already sizeable. Bulk-memory ops are
+# emitted by LLVM and supported by all current browsers/Node, so enable them
+# for the validator/optimizer.
+wasm-opt = ["-Oz", "--enable-bulk-memory"]

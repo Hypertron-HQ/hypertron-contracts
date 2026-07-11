@@ -8,6 +8,7 @@ members = [
     "contracts/compliance",
     "examples/merchant-settlement",
     "prover",
+    "prover-wasm",
 ]
 # The prover is a native std crate (arkworks + CLI); it must NOT be part of the
 # default set so `cargo build --target wasm32v1-none` only compiles the

@@ -12,6 +12,14 @@ path = "src/lib.rs"
 [[bin]]
 name = "hypertron-prove"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The `cli` feature pulls in clap and enables the `hypertron-prove` binary. It
+# is off for the WASM wrapper (which depends on this crate with
+# default-features = false) so clap never enters the browser build.
+cli = ["dep:clap"]
 
 [dependencies]
 # Same arkworks 0.4.x stack (and serialization) the Soroban host uses, so the
@@ -29,7 +37,7 @@ ark-std = "0.4"
 
 # CLI + IO.
 anyhow = "1"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -187,6 +187,43 @@ enum Cmd {
         #[arg(long)]
         blob: String,
     },
+    /// Convert a `vk.json` (from `setup`) into the on-chain `register_vk` struct
+    /// argument and print a ready-to-run `stellar contract invoke` command.
+    RegisterVkArgs {
+        /// Path to the verifying-key JSON emitted by `setup`.
+        #[arg(long)]
+        vk: PathBuf,
+        /// The id to register this key under (deposit=1, unshield=2, transfer=3).
+        #[arg(long)]
+        vk_id: u32,
+        /// Verifier contract id. If set, also prints the full invoke command.
+        #[arg(long)]
+        verifier: Option<String>,
+        /// stellar keys identity used as `--source` in the printed command.
+        #[arg(long, default_value = "hypertron")]
+        source: String,
+        /// Network passed as `--network` in the printed command.
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        /// Print ONLY the single-line struct JSON (for scripting / capture).
+        #[arg(long)]
+        compact: bool,
+    },
+}
+
+/// Validate that a hex string decodes to exactly `want_bytes` bytes.
+fn check_hex_len(name: &str, hex_str: &str, want_bytes: usize) -> Result<()> {
+    let s = hex_str.trim().strip_prefix("0x").unwrap_or_else(|| hex_str.trim());
+    hex::decode(s).map_err(|e| anyhow!("{name}: invalid hex: {e}"))?;
+    let got = s.len() / 2;
+    if s.len() % 2 != 0 || got != want_bytes {
+        return Err(anyhow!(
+            "{name}: expected {want_bytes} bytes ({} hex chars), got {} chars",
+            want_bytes * 2,
+            s.len()
+        ));
+    }
+    Ok(())
 }
 
 fn hex0x(bytes: [u8; 32]) -> String {
@@ -376,6 +413,51 @@ fn main() -> Result<()> {
             println!("n 0x{}", hex::encode(groth16::fr_be32(&note.n)));
             println!("k 0x{}", hex::encode(groth16::fr_be32(&note.k)));
             println!("v {}", note.v);
+        }
+
+        Cmd::RegisterVkArgs { vk, vk_id, verifier, source, network, compact } => {
+            let text = fs::read_to_string(&vk).with_context(|| format!("reading {}", vk.display()))?;
+            let vkj: groth16::VkJson = serde_json::from_str(&text)
+                .with_context(|| format!("parsing {} as a vk.json", vk.display()))?;
+
+            // On-chain layout: alpha/ic = uncompressed G1 (96 bytes),
+            // beta/gamma/delta = uncompressed G2 (192 bytes).
+            check_hex_len("alpha", &vkj.alpha, 96)?;
+            check_hex_len("beta", &vkj.beta, 192)?;
+            check_hex_len("gamma", &vkj.gamma, 192)?;
+            check_hex_len("delta", &vkj.delta, 192)?;
+            if vkj.ic.is_empty() {
+                return Err(anyhow!("vk.ic must have at least one element (constant term)"));
+            }
+            for (i, p) in vkj.ic.iter().enumerate() {
+                check_hex_len(&format!("ic[{i}]"), p, 96)?;
+            }
+
+            // The stellar CLI encodes a struct arg as JSON, with `BytesN` fields as
+            // hex strings and `Vec` as a JSON array — so the on-chain VerifyingKey
+            // struct has the exact same shape as `vk.json`.
+            let arg = serde_json::json!({
+                "alpha": vkj.alpha,
+                "beta": vkj.beta,
+                "gamma": vkj.gamma,
+                "delta": vkj.delta,
+                "ic": vkj.ic,
+            });
+
+            if compact {
+                // Machine-readable: just the arg, so callers can capture it.
+                println!("{}", serde_json::to_string(&arg)?);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&arg)?);
+                if let Some(v) = verifier {
+                    let arg_str = serde_json::to_string(&arg)?;
+                    println!();
+                    println!(
+                        "stellar contract invoke --id {v} --source {source} --network {network} -- \\\n  \
+                         register_vk --vk_id {vk_id} --vk '{arg_str}'"
+                    );
+                }
+            }
         }
     }
     Ok(())

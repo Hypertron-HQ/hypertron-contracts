@@ -1,0 +1,38 @@
+{
+  "name": "@hypertron/prover",
+  "version": "0.1.0",
+  "description": "Browser + Node WebAssembly prover for the Hypertron shielded pool (deposit / unshield / transfer proofs, viewing-key note encryption).",
+  "license": "Apache-2.0",
+  "keywords": [
+    "hypertron",
+    "stellar",
+    "soroban",
+    "zk",
+    "groth16",
+    "privacy",
+    "wasm"
+  ],
+  "files": [
+    "web",
+    "node",
+    "README.md"
+  ],
+  "main": "node/hypertron_prover.js",
+  "module": "web/hypertron_prover.js",
+  "types": "web/hypertron_prover.d.ts",
+  "exports": {
+    ".": {
+      "types": "./web/hypertron_prover.d.ts",
+      "node": "./node/hypertron_prover.js",
+      "browser": "./web/hypertron_prover.js",
+      "import": "./web/hypertron_prover.js",
+      "default": "./web/hypertron_prover.js"
+    },
+    "./web": "./web/hypertron_prover.js",
+    "./node": "./node/hypertron_prover.js"
+  },
+  "sideEffects": [
+    "./web/hypertron_prover.js",
+    "./node/hypertron_prover.js"
+  ]
+}

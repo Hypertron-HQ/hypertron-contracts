@@ -17,3 +17,11 @@
 *.vk.json
 proof.json
 *-proof.json
+
+# Generated WASM npm package (built by prover-wasm/build.sh)
+/prover-wasm/pkg/
+# Default vk output dir for scripts/deploy_testnet.sh (DEV_SETUP)
+/vk/
+
+# Node
+node_modules/

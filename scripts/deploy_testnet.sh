@@ -17,6 +17,17 @@ NETWORK="${NETWORK:-testnet}"
 SOURCE="${SOURCE:-hypertron}"          # stellar keys identity name
 TOKEN="${TOKEN:?set TOKEN to the SAC/token contract id for the pool asset}"
 
+# Directory holding the ceremony-produced verifying keys (see docs/ceremony.md):
+#   $VK_DIR/deposit.vk.json  $VK_DIR/unshield.vk.json  $VK_DIR/transfer.vk.json
+VK_DIR="${VK_DIR:-vk}"
+# DEV_SETUP=1 generates LOCAL, deterministic dev keys instead of requiring a
+# ceremony. NEVER use this for a real deployment — it has a known toxic waste.
+DEV_SETUP="${DEV_SETUP:-0}"
+# COMPLIANCE=1 also deploys hypertron_compliance and wires it into the pool.
+COMPLIANCE="${COMPLIANCE:-0}"
+# Compliance mode: true => denylist (allow unless listed), false => allowlist.
+COMPLIANCE_DEFAULT_ALLOW="${COMPLIANCE_DEFAULT_ALLOW:-true}"
+
 WASM_DIR="target/wasm32v1-none/release"
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
@@ -28,9 +39,34 @@ deploy() { # deploy <wasm-name>
 invoke() { # invoke <contract-id> <fn> [args...]
   stellar contract invoke --id "$1" --source "$SOURCE" --network "$NETWORK" -- "${@:2}"
 }
+prove() { # prove <args...> — run the off-chain prover/VK CLI, stdout only
+  cargo run -q -p hypertron-prover -- "$@"
+}
+register_vk() { # register_vk <verifier-id> <vk-id> <vk-json-file>
+  local arg
+  arg=$(prove register-vk-args --vk "$3" --vk-id "$2" --compact)
+  invoke "$1" register_vk --vk_id "$2" --vk "$arg"
+}
 
 log "Building contracts (release, wasm32v1-none)"
 cargo build --release --target wasm32v1-none
+
+if [ "$DEV_SETUP" = "1" ]; then
+  log "DEV_SETUP=1: generating LOCAL dev verifying keys in $VK_DIR (NOT for production)"
+  mkdir -p "$VK_DIR"
+  for c in deposit unshield transfer; do
+    prove setup --circuit "$c" \
+      --pk-out "$VK_DIR/$c.pk.bin" --vk-out "$VK_DIR/$c.vk.json" >/dev/null
+    echo "  generated $VK_DIR/$c.vk.json"
+  done
+fi
+
+for c in deposit unshield transfer; do
+  if [ ! -f "$VK_DIR/$c.vk.json" ]; then
+    echo "error: missing $VK_DIR/$c.vk.json (run the ceremony in docs/ceremony.md, or set DEV_SETUP=1)" >&2
+    exit 1
+  fi
+done
 
 log "Deploying commitment"
 COMMITMENT=$(deploy hypertron_commitment); echo "commitment = $COMMITMENT"
@@ -48,14 +84,20 @@ invoke "$COMMITMENT" initialize --authority "$POOL"
 invoke "$NULLIFIER"  initialize --authority "$POOL"
 invoke "$VERIFIER"   initialize --admin "$ADMIN"
 
-log "Registering verifying keys (see docs/ceremony.md for how to produce them)"
-# Encoding the arkworks VK JSON into the on-chain VerifyingKey struct is
-# environment-specific; register_vk expects the uncompressed-point layout the
-# prover's groth16::vk_json emits. Register deposit=1, unshield=2, transfer=3.
-echo "  -> register deposit.vk.json  under id 1"
-echo "  -> register unshield.vk.json under id 2"
-echo "  -> register transfer.vk.json under id 3"
-echo "  (use your VK-encoding helper / stellar contract invoke $VERIFIER register_vk ...)"
+log "Registering verifying keys (deposit=1, unshield=2, transfer=3)"
+# register_vk encodes each vk.json into the on-chain VerifyingKey struct via the
+# prover's `register-vk-args` helper (single source of truth for the layout).
+register_vk "$VERIFIER" 1 "$VK_DIR/deposit.vk.json"
+register_vk "$VERIFIER" 2 "$VK_DIR/unshield.vk.json"
+register_vk "$VERIFIER" 3 "$VK_DIR/transfer.vk.json"
+
+COMPLIANCE_ARG="null"
+if [ "$COMPLIANCE" = "1" ]; then
+  log "Deploying compliance (admin = $ADMIN)"
+  COMPLIANCE_ID=$(deploy hypertron_compliance); echo "compliance = $COMPLIANCE_ID"
+  invoke "$COMPLIANCE_ID" initialize --admin "$ADMIN" --default_allow "$COMPLIANCE_DEFAULT_ALLOW"
+  COMPLIANCE_ARG="\"$COMPLIANCE_ID\""
+fi
 
 log "Initializing the pool"
 invoke "$POOL" initialize --config "{
@@ -66,14 +108,14 @@ invoke "$POOL" initialize --config "{
   \"deposit_vk_id\": 1,
   \"unshield_vk_id\": 2,
   \"transfer_vk_id\": 3,
-  \"compliance\": null
+  \"compliance\": $COMPLIANCE_ARG
 }"
 
 log "Done. Pool = $POOL"
 cat <<EOF
 
 Next:
-  - Optionally deploy hypertron_compliance and set config.compliance to it.
-  - Fund users, then use the hypertron-prove CLI to build deposit/unshield/
-    transfer proofs and submit them (unshield/transfer are relayer-submittable).
+  - Fund users, then use the hypertron-prove CLI (or the @hypertron/prover WASM
+    package) to build deposit/unshield/transfer proofs and submit them
+    (unshield/transfer are relayer-submittable).
 EOF
