@@ -30,6 +30,10 @@ pub struct VkRegistered {
 /// Groth16 proof serialized as 3 curve points: A(G1,96) ‖ B(G2,192) ‖ C(G1,96).
 const PROOF_LEN: u32 = 96 + 192 + 96;
 
+/// Persistent storage TTL management (~30 day threshold, ~180 day bump).
+const TTL_THRESHOLD: u32 = 518_400;
+const TTL_BUMP: u32 = 3_110_400;
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -70,6 +74,7 @@ impl VerifierContract {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&Key::Admin, &admin);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         Ok(())
     }
 
@@ -82,6 +87,10 @@ impl VerifierContract {
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
         env.storage().persistent().set(&Key::Vk(vk_id), &vk);
+        env.storage()
+            .persistent()
+            .extend_ttl(&Key::Vk(vk_id), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         VkRegistered { vk_id }.publish(&env);
         Ok(())
     }

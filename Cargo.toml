@@ -5,6 +5,7 @@ members = [
     "contracts/nullifier",
     "contracts/verifier",
     "contracts/transfer",
+    "contracts/compliance",
     "examples/merchant-settlement",
     "prover",
 ]
@@ -16,6 +17,7 @@ default-members = [
     "contracts/nullifier",
     "contracts/verifier",
     "contracts/transfer",
+    "contracts/compliance",
     "examples/merchant-settlement",
 ]
 

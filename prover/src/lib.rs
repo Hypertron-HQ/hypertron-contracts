@@ -6,8 +6,10 @@
 //! `hypertron-prove` CLI is exactly what the chain verifies.
 
 pub mod circuit;
+pub mod crypto;
 pub mod groth16;
 pub mod merkle;
+pub mod note;
 pub mod poseidon;
 
 pub use ark_bls12_381::Fr;
@@ -56,39 +58,101 @@ pub fn parse_bytes32(s: &str) -> Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::circuit::{MembershipCircuit, DEPTH};
+    use crate::circuit::{DepositCircuit, TransferCircuit, UnshieldCircuit, DEPTH};
+    use crate::note::{commitment, nullifier, Note};
 
     #[test]
-    fn setup_prove_verify_roundtrip() {
-        let n = Fr::from(1234u64);
-        let k = Fr::from(5678u64);
-        let leaf = merkle::leaf(n, k);
-        let (root, siblings, path_bits) = merkle::path(&[leaf], 0, DEPTH);
-        let nullifier_hash = merkle::nullifier(n);
-        let recipient = Fr::from(0xABCDu64);
-        let amount = groth16::amount_fr(42);
-
-        let (pk, vk) = groth16::setup(DEPTH, 3).unwrap();
+    fn deposit_binds_value_to_commitment() {
+        let note = Note::new(Fr::from(7u64), Fr::from(8u64), Fr::from(500u64));
+        let cm = note.commitment();
+        let (pk, vk) = groth16::setup(DepositCircuit::empty(), 3).unwrap();
         let proof = groth16::prove(
             &pk,
-            MembershipCircuit {
+            DepositCircuit { cm: Some(cm), amount: Some(note.v), n: Some(note.n), k: Some(note.k) },
+            3,
+        )
+        .unwrap();
+        assert!(groth16::verify(&vk, &[cm, note.v], &proof));
+        // A lie about the deposited amount must fail.
+        assert!(!groth16::verify(&vk, &[cm, Fr::from(501u64)], &proof));
+    }
+
+    #[test]
+    fn unshield_conserves_value() {
+        let note = Note::new(Fr::from(1234u64), Fr::from(5678u64), Fr::from(1000u64));
+        let leaf = note.commitment();
+        let (root, siblings, path_bits) = merkle::path(&[leaf], 0, DEPTH);
+        let nf = nullifier(note.n);
+        let recipient = Fr::from(0xABCDu64);
+        let amount = Fr::from(700u64);
+        let change = Note::new(Fr::from(9u64), Fr::from(10u64), Fr::from(300u64));
+        let change_cm = change.commitment();
+
+        let (pk, vk) = groth16::setup(UnshieldCircuit::empty(DEPTH), 3).unwrap();
+        let proof = groth16::prove(
+            &pk,
+            UnshieldCircuit {
                 root: Some(root),
-                nullifier_hash: Some(nullifier_hash),
+                nullifier: Some(nf),
                 recipient: Some(recipient),
                 amount: Some(amount),
-                n: Some(n),
-                k: Some(k),
+                change_cm: Some(change_cm),
+                n: Some(note.n),
+                k: Some(note.k),
+                v: Some(note.v),
                 siblings: siblings.into_iter().map(Some).collect(),
                 path_bits: path_bits.into_iter().map(Some).collect(),
+                n2: Some(change.n),
+                k2: Some(change.k),
+                vc: Some(change.v),
             },
             3,
         )
         .unwrap();
+        assert!(groth16::verify(&vk, &[root, nf, recipient, amount, change_cm], &proof));
+        // Over-withdraw (amount that breaks v = amount + change) must fail.
+        assert!(!groth16::verify(&vk, &[root, nf, recipient, Fr::from(800u64), change_cm], &proof));
+    }
 
-        assert!(groth16::verify(&vk, &[root, nullifier_hash, recipient, amount], &proof));
-        // Wrong amount must fail: the payout is bound into the proof.
-        let wrong = groth16::amount_fr(43);
-        assert!(!groth16::verify(&vk, &[root, nullifier_hash, recipient, wrong], &proof));
+    #[test]
+    fn transfer_conserves_value_privately() {
+        let note = Note::new(Fr::from(3u64), Fr::from(4u64), Fr::from(1000u64));
+        let leaf = note.commitment();
+        let (root, siblings, path_bits) = merkle::path(&[leaf], 0, DEPTH);
+        let nf = nullifier(note.n);
+        let to = Note::new(Fr::from(21u64), Fr::from(22u64), Fr::from(600u64));
+        let change = Note::new(Fr::from(31u64), Fr::from(32u64), Fr::from(400u64));
+
+        let (pk, vk) = groth16::setup(TransferCircuit::empty(DEPTH), 3).unwrap();
+        let proof = groth16::prove(
+            &pk,
+            TransferCircuit {
+                root: Some(root),
+                nullifier: Some(nf),
+                out_cm1: Some(to.commitment()),
+                out_cm2: Some(change.commitment()),
+                n: Some(note.n),
+                k: Some(note.k),
+                v: Some(note.v),
+                siblings: siblings.into_iter().map(Some).collect(),
+                path_bits: path_bits.into_iter().map(Some).collect(),
+                n1: Some(to.n),
+                k1: Some(to.k),
+                v1: Some(to.v),
+                n2: Some(change.n),
+                k2: Some(change.k),
+                v2: Some(change.v),
+            },
+            3,
+        )
+        .unwrap();
+        assert!(groth16::verify(
+            &vk,
+            &[root, nf, to.commitment(), change.commitment()],
+            &proof
+        ));
+        // Tampered output commitment must fail.
+        assert!(!groth16::verify(&vk, &[root, nf, commitment(Fr::from(1u64), Fr::from(1u64), Fr::from(999u64)), change.commitment()], &proof));
     }
 
     #[test]

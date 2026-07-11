@@ -16,14 +16,21 @@ use soroban_sdk::{
 /// client so this consumer compiles to its own self-contained wasm.
 #[contractclient(name = "PoolClient")]
 pub trait PoolApi {
-    fn deposit(env: Env, from: Address, amount: i128, commitment: BytesN<32>) -> u32;
-    fn withdraw(
+    fn deposit(
+        env: Env,
+        from: Address,
+        amount: i128,
+        commitment: BytesN<32>,
+        deposit_proof: Bytes,
+    ) -> u32;
+    fn unshield(
         env: Env,
         proof: Bytes,
         root: BytesN<32>,
         nullifier: BytesN<32>,
         recipient: Address,
         amount: i128,
+        change_commitment: BytesN<32>,
         claim: PrivacyLevel,
     ) -> PrivacyAttestation;
 }
@@ -78,35 +85,39 @@ impl MerchantSettlement {
         Ok(())
     }
 
-    /// Customer pays `amount` into the shielded pool with a note commitment.
+    /// Customer pays `amount` into the shielded pool with a value-bound note.
     pub fn collect(
         env: Env,
         customer: Address,
         amount: i128,
         commitment: BytesN<32>,
+        deposit_proof: Bytes,
     ) -> Result<u32, Error> {
         let pool: Address = env.storage().instance().get(&Key::Pool).ok_or(Error::NotInitialized)?;
-        Ok(PoolClient::new(&env, &pool).deposit(&customer, &amount, &commitment))
+        Ok(PoolClient::new(&env, &pool).deposit(&customer, &amount, &commitment, &deposit_proof))
     }
 
-    /// Merchant settles a hidden amount to itself with an on-chain-verified proof.
+    /// Merchant settles a hidden amount to itself with an on-chain-verified proof,
+    /// keeping any remainder as a change note in the pool.
     pub fn settle(
         env: Env,
         proof: Bytes,
         root: BytesN<32>,
         nullifier: BytesN<32>,
         amount: i128,
+        change_commitment: BytesN<32>,
         claim: PrivacyLevel,
     ) -> Result<PrivacyAttestation, Error> {
         let pool: Address = env.storage().instance().get(&Key::Pool).ok_or(Error::NotInitialized)?;
         let merchant: Address =
             env.storage().instance().get(&Key::Merchant).ok_or(Error::NotInitialized)?;
-        Ok(PoolClient::new(&env, &pool).withdraw(
+        Ok(PoolClient::new(&env, &pool).unshield(
             &proof,
             &root,
             &nullifier,
             &merchant,
             &amount,
+            &change_commitment,
             &claim,
         ))
     }

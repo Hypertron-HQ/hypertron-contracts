@@ -1,18 +1,20 @@
-//! On-chain verification of the Hypertron membership circuit.
+//! On-chain verification of the Hypertron transaction circuits.
 //!
-//! The circuit + prover live in the `hypertron-prover` crate (the same code the
-//! `hypertron-prove` CLI ships to integrators). Here we prove that a REAL proof
-//! from that crate verifies inside the deployed `VerifierContract`, and drive a
-//! full shielded-pool deposit -> prove -> withdraw with no mocks.
+//! The circuits + prover live in the `hypertron-prover` crate (the same code the
+//! `hypertron-prove` CLI ships to integrators). Here we prove that REAL proofs
+//! from that crate verify inside the deployed `VerifierContract`, and drive a
+//! full shielded-pool lifecycle — deposit (value-bound) -> unshield (with change)
+//! -> fully-private transfer — end to end with no mocks.
 #![cfg(test)]
 
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalSerialize;
+use ark_std::vec;
 
-use hypertron_prover::circuit::{MembershipCircuit, DEPTH};
-use hypertron_prover::groth16;
-use hypertron_prover::merkle;
+use hypertron_prover::circuit::{DepositCircuit, TransferCircuit, UnshieldCircuit, DEPTH};
+use hypertron_prover::note::Note;
+use hypertron_prover::{groth16, merkle};
 
 use crate::{VerifierContract, VerifierContractClient, VerifyingKey};
 use soroban_sdk::{testutils::Address as _, Address, Bytes, BytesN, Env, Vec as SVec};
@@ -65,85 +67,90 @@ fn proof_to_bytes(env: &Env, proof: &ark_groth16::Proof<Bls12_381>) -> Bytes {
     Bytes::from_slice(env, &pb)
 }
 
+/// A real unshield proof verifies on-chain, and every public input is bound:
+/// wrong root, wrong recipient, or wrong amount all fail.
 #[test]
-fn real_membership_proof_verifies_on_chain() {
+fn real_unshield_proof_verifies_on_chain() {
     let env = Env::default();
     env.mock_all_auths();
+    // Real pairing checks + Poseidon Merkle updates are heavier than the tiny
+    // default test budget; use a realistic (unbounded) budget for these tests.
+    env.cost_estimate().budget().reset_unlimited();
 
-    // ---- 1. Build a note and insert its commitment into the ON-CHAIN tree.
-    let n = Fr::from(11111u64);
-    let k = Fr::from(22222u64);
-    let leaf = merkle::leaf(n, k);
+    // Value-committed note worth 1000, inserted into the on-chain tree.
+    let input = Note::new(Fr::from(11111u64), Fr::from(22222u64), Fr::from(1000u64));
+    let leaf = input.commitment();
 
     let commitment_id = env.register(hypertron_commitment::CommitmentContract, ());
     let tree = hypertron_commitment::CommitmentContractClient::new(&env, &commitment_id);
     tree.initialize(&Address::generate(&env));
-    tree.insert(&fr_to_bytesn(&env, &leaf)); // leftmost leaf, index 0
+    tree.insert(&fr_to_bytesn(&env, &leaf));
     let root_bytes = tree.root();
     let root = bytesn_to_fr(&root_bytes);
 
-    // ---- 2. Reconstruct the path off-chain with the prover's Merkle helper.
     let (root_off, siblings, path_bits) = merkle::path(&[leaf], 0, DEPTH);
     assert_eq!(root_off, root, "off-chain root must equal on-chain root");
 
-    let nullifier_hash = merkle::nullifier(n);
+    let nf = input.nullifier();
     let recipient_fe = Fr::from(0xC0FFEEu64);
-    let amount_fe = Fr::from(50u64);
+    let amount = Fr::from(700u64);
+    let change = Note::new(Fr::from(9u64), Fr::from(10u64), Fr::from(300u64));
+    let change_cm = change.commitment();
 
-    // ---- 3. Groth16 setup + prove the membership statement.
-    let (pk, vk) = groth16::setup(DEPTH, 7).unwrap();
-    let circuit = MembershipCircuit {
+    let (pk, vk) = groth16::setup(UnshieldCircuit::empty(DEPTH), 7).unwrap();
+    let circuit = UnshieldCircuit {
         root: Some(root),
-        nullifier_hash: Some(nullifier_hash),
+        nullifier: Some(nf),
         recipient: Some(recipient_fe),
-        amount: Some(amount_fe),
-        n: Some(n),
-        k: Some(k),
+        amount: Some(amount),
+        change_cm: Some(change_cm),
+        n: Some(input.n),
+        k: Some(input.k),
+        v: Some(input.v),
         siblings: siblings.into_iter().map(Some).collect(),
         path_bits: path_bits.into_iter().map(Some).collect(),
+        n2: Some(change.n),
+        k2: Some(change.k),
+        vc: Some(change.v),
     };
     let proof = groth16::prove(&pk, circuit, 7).unwrap();
+    assert!(groth16::verify(&vk, &[root, nf, recipient_fe, amount, change_cm], &proof));
 
-    // Sanity: verifies off-chain.
-    assert!(groth16::verify(&vk, &[root, nullifier_hash, recipient_fe, amount_fe], &proof));
-
-    // ---- 4. Verify the SAME proof ON-CHAIN against the real root.
     let verifier_id = env.register(VerifierContract, ());
     let verifier = VerifierContractClient::new(&env, &verifier_id);
     verifier.initialize(&Address::generate(&env));
     verifier.register_vk(&1, &to_soroban_vk(&env, &vk));
 
-    let mut pubs: SVec<BytesN<32>> = SVec::new(&env);
-    pubs.push_back(root_bytes.clone());
-    pubs.push_back(fr_to_bytesn(&env, &nullifier_hash));
-    pubs.push_back(fr_to_bytesn(&env, &recipient_fe));
-    pubs.push_back(fr_to_bytesn(&env, &amount_fe));
-    assert!(verifier.verify(&1, &proof_to_bytes(&env, &proof), &pubs));
+    let good = |a, b, c, d, e| {
+        let mut p: SVec<BytesN<32>> = SVec::new(&env);
+        p.push_back(a);
+        p.push_back(b);
+        p.push_back(c);
+        p.push_back(d);
+        p.push_back(e);
+        p
+    };
+    let proof_bytes = proof_to_bytes(&env, &proof);
+    let rec = fr_to_bytesn(&env, &recipient_fe);
+    let amt = fr_to_bytesn(&env, &amount);
+    let ch = fr_to_bytesn(&env, &change_cm);
+    let nfb = fr_to_bytesn(&env, &nf);
 
-    // A proof presented against a different (wrong) root must fail.
-    let mut bad = SVec::new(&env);
-    bad.push_back(fr_to_bytesn(&env, &Fr::from(999u64)));
-    bad.push_back(fr_to_bytesn(&env, &nullifier_hash));
-    bad.push_back(fr_to_bytesn(&env, &recipient_fe));
-    bad.push_back(fr_to_bytesn(&env, &amount_fe));
-    assert!(!verifier.verify(&1, &proof_to_bytes(&env, &proof), &bad));
-
-    // A proof presented for a DIFFERENT recipient must fail: the relayer-
-    // rebinding attack the recipient public input defends against.
-    let mut wrong_recipient = SVec::new(&env);
-    wrong_recipient.push_back(root_bytes.clone());
-    wrong_recipient.push_back(fr_to_bytesn(&env, &nullifier_hash));
-    wrong_recipient.push_back(fr_to_bytesn(&env, &Fr::from(0xBADu64)));
-    wrong_recipient.push_back(fr_to_bytesn(&env, &amount_fe));
-    assert!(!verifier.verify(&1, &proof_to_bytes(&env, &proof), &wrong_recipient));
+    assert!(verifier.verify(&1, &proof_bytes, &good(root_bytes.clone(), nfb.clone(), rec.clone(), amt.clone(), ch.clone())));
+    // Wrong root.
+    assert!(!verifier.verify(&1, &proof_bytes, &good(fr_to_bytesn(&env, &Fr::from(999u64)), nfb.clone(), rec.clone(), amt.clone(), ch.clone())));
+    // Wrong recipient (relayer-rebinding defense).
+    assert!(!verifier.verify(&1, &proof_bytes, &good(root_bytes.clone(), nfb.clone(), fr_to_bytesn(&env, &Fr::from(0xBADu64)), amt.clone(), ch.clone())));
+    // Wrong amount (value-conservation binding).
+    assert!(!verifier.verify(&1, &proof_bytes, &good(root_bytes.clone(), nfb, rec, fr_to_bytesn(&env, &Fr::from(800u64)), ch)));
 }
 
-/// End-to-end: a real note is deposited into the shielded pool, a REAL Groth16
-/// proof is produced off-chain (via `hypertron-prover`) binding (root, nullifier,
-/// recipient, amount), and `transfer.withdraw` verifies it on-chain via the real
-/// verifier, spends the nullifier, and pays the recipient. No mocks.
+/// Full end-to-end lifecycle with REAL proofs and no mocks:
+///   1. deposit a value-bound note (deposit circuit),
+///   2. unshield part of it to a public recipient, keeping a change note,
+///   3. fully-private transfer of a second note into two output notes.
 #[test]
-fn full_shielded_pool_withdraw_with_real_proof() {
+fn full_shielded_pool_lifecycle_with_real_proofs() {
     use hypertron_commitment::{CommitmentContract, CommitmentContractClient};
     use hypertron_nullifier::{NullifierContract, NullifierContractClient};
     use hypertron_transfer::{Config, PrivacyLevel, TransferContract, TransferContractClient};
@@ -154,8 +161,8 @@ fn full_shielded_pool_withdraw_with_real_proof() {
 
     let env = Env::default();
     env.mock_all_auths_allowing_non_root_auth();
+    env.cost_estimate().budget().reset_unlimited();
 
-    // ---- Token + component contracts.
     let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
     let token = sac.address();
     let token_admin = StellarAssetClient::new(&env, &token);
@@ -168,60 +175,79 @@ fn full_shielded_pool_withdraw_with_real_proof() {
     CommitmentContractClient::new(&env, &commitment_id).initialize(&transfer_id);
     NullifierContractClient::new(&env, &nullifier_id).initialize(&transfer_id);
 
+    // Three circuits, three verifying keys.
+    let (deposit_pk, deposit_vk) = groth16::setup(DepositCircuit::empty(), 1).unwrap();
+    let (unshield_pk, unshield_vk) = groth16::setup(UnshieldCircuit::empty(DEPTH), 2).unwrap();
+    let (transfer_pk, transfer_vk) = groth16::setup(TransferCircuit::empty(DEPTH), 3).unwrap();
+
+    let verifier = VerifierContractClient::new(&env, &verifier_id);
+    verifier.initialize(&Address::generate(&env));
+    verifier.register_vk(&1, &to_soroban_vk(&env, &deposit_vk));
+    verifier.register_vk(&2, &to_soroban_vk(&env, &unshield_vk));
+    verifier.register_vk(&3, &to_soroban_vk(&env, &transfer_vk));
+
     let pool = TransferContractClient::new(&env, &transfer_id);
     pool.initialize(&Config {
         token: token.clone(),
         commitment: commitment_id.clone(),
         nullifier: nullifier_id.clone(),
         verifier: verifier_id.clone(),
-        vk_id: 1,
+        deposit_vk_id: 1,
+        unshield_vk_id: 2,
+        transfer_vk_id: 3,
+        compliance: None,
     });
-
-    // ---- 1. Deposit a real note into the pool (leaf = Poseidon(n, k)).
-    let n = Fr::from(424242u64);
-    let k = Fr::from(133742u64);
-    let leaf = merkle::leaf(n, k);
+    let tree = CommitmentContractClient::new(&env, &commitment_id);
 
     let depositor = Address::generate(&env);
-    token_admin.mint(&depositor, &1000);
-    pool.deposit(&depositor, &100, &fr_to_bytesn(&env, &leaf));
+    token_admin.mint(&depositor, &10_000);
 
-    let root_bytes = CommitmentContractClient::new(&env, &commitment_id).root();
-    let root = bytesn_to_fr(&root_bytes);
-
-    // ---- 2. Off-chain: reconstruct the path and derive the public inputs.
-    let (_root_off, siblings, path_bits) = merkle::path(&[leaf], 0, DEPTH);
-    let nullifier_hash = merkle::nullifier(n);
-
-    let recipient = Address::generate(&env);
-    let amount: i128 = 50;
-    // Must match `transfer::recipient_field` / `amount_field` exactly.
-    let recipient_bytes = env.crypto().sha256(&recipient.clone().to_xdr(&env)).to_bytes();
-    let recipient_fe = bytesn_to_fr(&recipient_bytes);
-    let amount_fe = groth16::amount_fr(amount as u128);
-
-    // ---- 3. Groth16 setup + prove.
-    let (pk, _vk) = groth16::setup(DEPTH, 99).unwrap();
-    let proof = groth16::prove(
-        &pk,
-        MembershipCircuit {
-            root: Some(root),
-            nullifier_hash: Some(nullifier_hash),
-            recipient: Some(recipient_fe),
-            amount: Some(amount_fe),
-            n: Some(n),
-            k: Some(k),
-            siblings: siblings.into_iter().map(Some).collect(),
-            path_bits: path_bits.into_iter().map(Some).collect(),
-        },
-        99,
+    // ---- 1. Deposit note A worth 100 (value bound by a real deposit proof). --
+    let a = Note::new(Fr::from(424242u64), Fr::from(133742u64), Fr::from(100u64));
+    let deposit_proof = groth16::prove(
+        &deposit_pk,
+        DepositCircuit { cm: Some(a.commitment()), amount: Some(a.v), n: Some(a.n), k: Some(a.k) },
+        11,
     )
     .unwrap();
+    pool.deposit(
+        &depositor,
+        &100,
+        &fr_to_bytesn(&env, &a.commitment()),
+        &proof_to_bytes(&env, &deposit_proof),
+    );
+    let mut leaves = vec![a.commitment()]; // mirror of the on-chain tree
+    let root_a_bytes = tree.root();
+    let root_a = bytesn_to_fr(&root_a_bytes);
 
-    // ---- 4. Register the VK and run the REAL withdrawal.
-    let verifier = VerifierContractClient::new(&env, &verifier_id);
-    verifier.initialize(&Address::generate(&env));
-    verifier.register_vk(&1, &to_soroban_vk(&env, &pk.vk));
+    // ---- 2. Unshield 60 to a recipient, 40 stays as a change note. ----------
+    let recipient = Address::generate(&env);
+    let amount: i128 = 60;
+    let recipient_bytes = env.crypto().sha256(&recipient.clone().to_xdr(&env)).to_bytes();
+    let recipient_fe = bytesn_to_fr(&recipient_bytes);
+    let change = Note::new(Fr::from(5u64), Fr::from(6u64), Fr::from(40u64));
+
+    let (_r, siblings, path_bits) = merkle::path(&leaves, 0, DEPTH);
+    let unshield_proof = groth16::prove(
+        &unshield_pk,
+        UnshieldCircuit {
+            root: Some(root_a),
+            nullifier: Some(a.nullifier()),
+            recipient: Some(recipient_fe),
+            amount: Some(Fr::from(amount as u64)),
+            change_cm: Some(change.commitment()),
+            n: Some(a.n),
+            k: Some(a.k),
+            v: Some(a.v),
+            siblings: siblings.into_iter().map(Some).collect(),
+            path_bits: path_bits.into_iter().map(Some).collect(),
+            n2: Some(change.n),
+            k2: Some(change.k),
+            vc: Some(change.v),
+        },
+        12,
+    )
+    .unwrap();
 
     let claim = PrivacyLevel {
         sender: true,
@@ -230,32 +256,86 @@ fn full_shielded_pool_withdraw_with_real_proof() {
         timing: false,
         linkability: true,
     };
-    let att = pool.withdraw(
-        &proof_to_bytes(&env, &proof),
-        &root_bytes,
-        &fr_to_bytesn(&env, &nullifier_hash),
+    pool.unshield(
+        &proof_to_bytes(&env, &unshield_proof),
+        &root_a_bytes,
+        &fr_to_bytesn(&env, &a.nullifier()),
         &recipient,
         &amount,
+        &fr_to_bytesn(&env, &change.commitment()),
         &claim,
     );
+    leaves.push(change.commitment()); // change re-inserted at index 1
+    assert_eq!(TokenClient::new(&env, &token).balance(&recipient), 60);
+    assert_eq!(TokenClient::new(&env, &token).balance(&transfer_id), 40);
+    assert_eq!(tree.size(), 2);
 
-    assert_eq!(TokenClient::new(&env, &token).balance(&recipient), 50);
-    assert_eq!(TokenClient::new(&env, &token).balance(&transfer_id), 50);
-    assert!(att.level.sender);
-    assert_eq!(att.root, root_bytes);
+    // ---- 3. Deposit note B worth 100, then privately transfer it. -----------
+    let b = Note::new(Fr::from(777u64), Fr::from(888u64), Fr::from(100u64));
+    let deposit_b = groth16::prove(
+        &deposit_pk,
+        DepositCircuit { cm: Some(b.commitment()), amount: Some(b.v), n: Some(b.n), k: Some(b.k) },
+        13,
+    )
+    .unwrap();
+    pool.deposit(&depositor, &100, &fr_to_bytesn(&env, &b.commitment()), &proof_to_bytes(&env, &deposit_b));
+    leaves.push(b.commitment()); // index 2
+    let root_b_bytes = tree.root();
+    let root_b = bytesn_to_fr(&root_b_bytes);
 
-    // ---- 5. The proof is bound to `amount`: replaying it for a different
-    // amount is rejected.
-    let n2 = Fr::from(555u64);
-    let leaf2 = merkle::leaf(n2, k);
-    pool.deposit(&depositor, &100, &fr_to_bytesn(&env, &leaf2));
-    let bad = pool.try_withdraw(
-        &proof_to_bytes(&env, &proof),
-        &CommitmentContractClient::new(&env, &commitment_id).root(),
-        &fr_to_bytesn(&env, &merkle::nullifier(n2)),
-        &recipient,
-        &40, // != bound amount (50) -> proof invalid
-        &claim,
+    // B (100) -> out1 (70, to recipient) + out2 (30, change). No public amount.
+    let out1 = Note::new(Fr::from(101u64), Fr::from(102u64), Fr::from(70u64));
+    let out2 = Note::new(Fr::from(201u64), Fr::from(202u64), Fr::from(30u64));
+    let (_rb, sib_b, bits_b) = merkle::path(&leaves, 2, DEPTH);
+    let transfer_proof = groth16::prove(
+        &transfer_pk,
+        TransferCircuit {
+            root: Some(root_b),
+            nullifier: Some(b.nullifier()),
+            out_cm1: Some(out1.commitment()),
+            out_cm2: Some(out2.commitment()),
+            n: Some(b.n),
+            k: Some(b.k),
+            v: Some(b.v),
+            siblings: sib_b.into_iter().map(Some).collect(),
+            path_bits: bits_b.into_iter().map(Some).collect(),
+            n1: Some(out1.n),
+            k1: Some(out1.k),
+            v1: Some(out1.v),
+            n2: Some(out2.n),
+            k2: Some(out2.k),
+            v2: Some(out2.v),
+        },
+        14,
+    )
+    .unwrap();
+
+    let empty = Bytes::new(&env);
+    pool.transfer(
+        &proof_to_bytes(&env, &transfer_proof),
+        &root_b_bytes,
+        &fr_to_bytesn(&env, &b.nullifier()),
+        &fr_to_bytesn(&env, &out1.commitment()),
+        &fr_to_bytesn(&env, &out2.commitment()),
+        &empty,
+        &empty,
+    );
+    // Leaves so far: A, change, B, out1, out2 = 5. Nothing left the pool in the
+    // private transfer, so the balance is still 40 (100 in from B) + 40 change.
+    assert_eq!(tree.size(), 5);
+    assert_eq!(TokenClient::new(&env, &token).balance(&transfer_id), 140);
+
+    // Value conservation holds: a transfer whose outputs don't sum to the input
+    // cannot even be proven, so no on-chain check is needed — but a replayed
+    // (double-spent) nullifier is rejected.
+    let bad = pool.try_transfer(
+        &proof_to_bytes(&env, &transfer_proof),
+        &root_b_bytes,
+        &fr_to_bytesn(&env, &b.nullifier()),
+        &fr_to_bytesn(&env, &out1.commitment()),
+        &fr_to_bytesn(&env, &out2.commitment()),
+        &empty,
+        &empty,
     );
     assert!(bad.is_err());
 }

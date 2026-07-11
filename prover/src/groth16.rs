@@ -10,12 +10,11 @@ use anyhow::Result;
 use ark_bls12_381::{Bls12_381, Fr, G1Affine, G2Affine};
 use ark_ff::{BigInteger, PrimeField};
 use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
+use ark_relations::r1cs::ConstraintSynthesizer;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
 use ark_std::rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
-
-use crate::circuit::MembershipCircuit;
 
 /// Verifying key in the exact shape the `hypertron-verifier` contract stores,
 /// hex-encoded for transport / on-chain registration.
@@ -28,30 +27,32 @@ pub struct VkJson {
     pub ic: Vec<String>,
 }
 
-/// A proof plus the public inputs it was bound to, ready for `transfer.withdraw`
-/// (public inputs order: `[root, nullifier, recipient, amount]`).
+/// A proof plus the public inputs it was bound to, ready to submit on-chain.
+/// The `public_inputs` order matches the corresponding circuit's allocation.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProofJson {
     pub proof: String,
     pub public_inputs: Vec<String>,
 }
 
-/// Run a Groth16 setup for the membership circuit of the given `depth`.
+/// Run a Groth16 setup for any circuit shape.
 ///
 /// NOTE: this is a *local, deterministic* setup for development and testing.
 /// A production deployment must run a proper multi-party trusted-setup ceremony
-/// and publish the resulting verifying key.
-pub fn setup(depth: usize, seed: u64) -> Result<(ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>)> {
+/// and publish the resulting verifying key (see `docs/ceremony.md`).
+pub fn setup<C: ConstraintSynthesizer<Fr>>(
+    circuit: C,
+    seed: u64,
+) -> Result<(ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>)> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let (pk, vk) =
-        Groth16::<Bls12_381>::circuit_specific_setup(MembershipCircuit::empty(depth), &mut rng)?;
+    let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(circuit, &mut rng)?;
     Ok((pk, vk))
 }
 
 /// Produce a proof for a fully-assigned witness.
-pub fn prove(
+pub fn prove<C: ConstraintSynthesizer<Fr>>(
     pk: &ProvingKey<Bls12_381>,
-    circuit: MembershipCircuit,
+    circuit: C,
     seed: u64,
 ) -> Result<Proof<Bls12_381>> {
     let mut rng = StdRng::seed_from_u64(seed);

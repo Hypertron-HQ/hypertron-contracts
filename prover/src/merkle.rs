@@ -6,16 +6,6 @@ use ark_bls12_381::Fr;
 
 use crate::poseidon::poseidon2to1;
 
-/// note commitment `leaf = Poseidon(n, k)`.
-pub fn leaf(n: Fr, k: Fr) -> Fr {
-    poseidon2to1(n, k)
-}
-
-/// `nullifier_hash = Poseidon(n, 0)`.
-pub fn nullifier(n: Fr) -> Fr {
-    poseidon2to1(n, Fr::from(0u64))
-}
-
 /// Root of an empty subtree at each level: `zeros[0] = 0`,
 /// `zeros[i+1] = Poseidon(zeros[i], zeros[i])`.
 pub fn zeros(depth: usize) -> Vec<Fr> {

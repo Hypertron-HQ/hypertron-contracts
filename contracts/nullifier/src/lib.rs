@@ -46,6 +46,7 @@ impl NullifierContract {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&Key::Authority, &authority);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
         Ok(())
     }
 
@@ -68,7 +69,10 @@ impl NullifierContract {
             return Err(Error::AlreadySpent);
         }
         env.storage().persistent().set(&key, &true);
+        // Nullifiers are safety-critical: extend aggressively so a spent note is
+        // never forgotten (a forgotten nullifier would permit a double-spend).
         env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
         NullifierSpent { nullifier }.publish(&env);
         Ok(())

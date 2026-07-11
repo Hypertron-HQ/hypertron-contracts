@@ -1,21 +1,28 @@
 //! Hypertron Confidential Transfer
 //!
-//! The composition layer: a shielded pool that snaps together the commitment
-//! tree, the nullifier registry, and the on-chain proof verifier. This is the
-//! first contract most integrators reach for.
+//! The composition layer: a value-committed shielded pool that snaps together
+//! the commitment tree, the nullifier registry, and the on-chain proof verifier.
 //!
-//! Flow:
-//!   deposit()  -> pull tokens in, add a note commitment to the tree.
-//!   withdraw() -> verify a proof on-chain, spend a nullifier, pay out, and
-//!                 emit a verifiable Privacy Attestation.
+//! Notes are value-committed: `cm = Poseidon(Poseidon(n,k), v)`. Three flows,
+//! each backed by its own verifying key so value can never be minted:
+//!
+//!   deposit()  -> shield: pull tokens in, prove the note commits to `amount`.
+//!   unshield() -> exit: prove membership + nullifier + `v = amount + change`,
+//!                 pay a public recipient, re-insert the change note.
+//!   transfer() -> fully private note->note: no public address or amount; only
+//!                 nullifier + two output commitments (+ encrypted payloads).
+//!
+//! Relayer model: `unshield`/`transfer` require NO auth from the note owner, so
+//! a relayer can submit them and pay fees — the fee payer never links to the
+//! sender. `deposit` is the only transparent entry and authorizes the depositor.
 //!
 //! Note: in Soroban, returning `Err` does NOT revert state. Every validation
 //! therefore runs *before* any state mutation or token movement.
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contractevent, contracterror, contractimpl, contracttype,
-    token, xdr::ToXdr, Address, Bytes, BytesN, Env, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, token,
+    xdr::ToXdr, Address, Bytes, BytesN, Env, Vec,
 };
 
 /// Cross-contract interfaces. We call components through generated clients
@@ -42,6 +49,13 @@ pub trait VerifierApi {
     fn verify(env: Env, vk_id: u32, proof: Bytes, public_inputs: Vec<BytesN<32>>) -> bool;
 }
 
+/// Optional compliance policy: a separate, swappable module consulted only at
+/// the transparent exit (`unshield`). Kept OUT of the ZK core on purpose.
+#[contractclient(name = "ComplianceClient")]
+pub trait ComplianceApi {
+    fn is_allowed(env: Env, account: Address) -> bool;
+}
+
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -53,7 +67,15 @@ pub enum Error {
     InvalidProof = 5,
     InvalidAmount = 6,
     UnsupportedLevelClaim = 7,
+    RecipientNotAllowed = 8,
 }
+
+// TTL policy: keep the pool's instance storage alive well past a month so a
+// quiet pool does not get archived out from under its users. (Persistent
+// component storage — roots, nullifiers — is bumped inside those contracts.)
+const LEDGERS_PER_DAY: u32 = 17_280;
+const TTL_THRESHOLD: u32 = LEDGERS_PER_DAY * 30;
+const TTL_EXTEND: u32 = LEDGERS_PER_DAY * 60;
 
 /// The leakage dimensions this protocol reasons about (see privacy-framework.md).
 /// A payment may only *claim* a dimension the mechanism actually backs.
@@ -87,15 +109,29 @@ pub struct Deposited {
     pub amount: i128,
 }
 
-/// Emitted on a shielded withdrawal.
+/// Emitted on a shielded exit (unshield). `change_index` is the leaf position
+/// of the change note re-inserted into the pool.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Withdrawn {
+pub struct Unshielded {
     pub nullifier: BytesN<32>,
     pub amount: i128,
+    pub change_index: u32,
 }
 
-/// The verifiable Privacy Attestation, emitted after a successful withdrawal.
+/// Emitted on a fully-private transfer. Carries the two new commitment indices
+/// and their encrypted payloads so recipients can discover notes by scanning.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrivateTransfer {
+    pub nullifier: BytesN<32>,
+    pub out_index_1: u32,
+    pub out_index_2: u32,
+    pub note_1: Bytes,
+    pub note_2: Bytes,
+}
+
+/// The verifiable Privacy Attestation, emitted after a successful exit.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrivacyAttested {
@@ -109,7 +145,12 @@ pub struct Config {
     pub commitment: Address,
     pub nullifier: Address,
     pub verifier: Address,
-    pub vk_id: u32,
+    /// Verifying-key ids, one per circuit.
+    pub deposit_vk_id: u32,
+    pub unshield_vk_id: u32,
+    pub transfer_vk_id: u32,
+    /// Optional exit-time allowlist policy (compliance hook).
+    pub compliance: Option<Address>,
 }
 
 #[contracttype]
@@ -131,6 +172,7 @@ impl TransferContract {
             return Err(Error::AlreadyInitialized);
         }
         env.storage().instance().set(&Key::Config, &config);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
         Ok(())
     }
 
@@ -138,19 +180,31 @@ impl TransferContract {
         load_config(&env)
     }
 
-    /// Shielded deposit: move `amount` of the pool token in and record a note
-    /// commitment. Returns the leaf index.
+    /// Shielded deposit (shield). Moves `amount` of the pool token in and records
+    /// a note commitment, but only after a proof that the commitment actually
+    /// opens to `amount` — so a deposit cannot mint a note worth more than the
+    /// tokens paid in. Returns the leaf index.
     pub fn deposit(
         env: Env,
         from: Address,
         amount: i128,
         commitment: BytesN<32>,
+        deposit_proof: Bytes,
     ) -> Result<u32, Error> {
         from.require_auth();
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
         let cfg = load_config(&env)?;
+
+        // Bind commitment <-> amount. Public inputs order: [cm, amount].
+        let mut public_inputs: Vec<BytesN<32>> = Vec::new(&env);
+        public_inputs.push_back(commitment.clone());
+        public_inputs.push_back(amount_field(&env, amount));
+        let verifier = VerifierClient::new(&env, &cfg.verifier);
+        if !verifier.verify(&cfg.deposit_vk_id, &deposit_proof, &public_inputs) {
+            return Err(Error::InvalidProof);
+        }
 
         token::Client::new(&env, &cfg.token).transfer(
             &from,
@@ -159,32 +213,43 @@ impl TransferContract {
         );
 
         let index = CommitmentClient::new(&env, &cfg.commitment).insert(&commitment);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
 
         Deposited { index, amount }.publish(&env);
         Ok(index)
     }
 
-    /// Shielded withdrawal: verify the proof on-chain, spend the nullifier,
-    /// pay the recipient, and emit a Privacy Attestation.
-    pub fn withdraw(
+    /// Shielded exit (unshield): verify the proof on-chain, spend the nullifier,
+    /// re-insert the change note, pay the recipient, and attest. Permissionless
+    /// (relayer-submittable): the payout is bound in the proof, so no note-owner
+    /// signature is needed and the fee payer never links to the sender.
+    pub fn unshield(
         env: Env,
         proof: Bytes,
         root: BytesN<32>,
         nullifier: BytesN<32>,
         recipient: Address,
         amount: i128,
+        change_commitment: BytesN<32>,
         claim: PrivacyLevel,
     ) -> Result<PrivacyAttestation, Error> {
         // ---- validation phase (no state changes) ----
         if amount <= 0 {
             return Err(Error::InvalidAmount);
         }
-        // This mechanism (shielded pool) cannot provide timing privacy on its
-        // own, so a timing claim would be unbacked and is rejected.
+        // A shielded pool cannot provide timing privacy on its own, so a timing
+        // claim would be unbacked and is rejected.
         if claim.timing {
             return Err(Error::UnsupportedLevelClaim);
         }
         let cfg = load_config(&env)?;
+
+        // Optional compliance gate at the transparent exit only.
+        if let Some(policy) = cfg.compliance.clone() {
+            if !ComplianceClient::new(&env, &policy).is_allowed(&recipient) {
+                return Err(Error::RecipientNotAllowed);
+            }
+        }
 
         let commitment = CommitmentClient::new(&env, &cfg.commitment);
         if !commitment.is_known_root(&root) {
@@ -196,29 +261,31 @@ impl TransferContract {
             return Err(Error::NullifierAlreadySpent);
         }
 
-        // The public inputs are DERIVED from the actual payout parameters, so
-        // the proof is cryptographically bound to this exact (root, nullifier,
-        // recipient, amount). A relayer cannot redirect funds or change the
-        // amount without invalidating the proof.
-        // Order must match the circuit: [root, nullifier, recipient, amount].
+        // Public inputs are DERIVED from the payout so the proof is bound to this
+        // exact (root, nullifier, recipient, amount, change). A relayer cannot
+        // redirect funds, change the amount, or steal the change note.
+        // Order must match the circuit: [root, nullifier, recipient, amount, change_cm].
         let mut public_inputs: Vec<BytesN<32>> = Vec::new(&env);
         public_inputs.push_back(root.clone());
         public_inputs.push_back(nullifier.clone());
         public_inputs.push_back(recipient_field(&env, &recipient));
         public_inputs.push_back(amount_field(&env, amount));
+        public_inputs.push_back(change_commitment.clone());
 
         let verifier = VerifierClient::new(&env, &cfg.verifier);
-        if !verifier.verify(&cfg.vk_id, &proof, &public_inputs) {
+        if !verifier.verify(&cfg.unshield_vk_id, &proof, &public_inputs) {
             return Err(Error::InvalidProof);
         }
 
         // ---- effects phase ----
         nullifiers.mark_spent(&nullifier);
+        let change_index = commitment.insert(&change_commitment);
         token::Client::new(&env, &cfg.token).transfer(
             &env.current_contract_address(),
             &recipient,
             &amount,
         );
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
 
         let level = PrivacyLevel {
             sender: true,
@@ -227,23 +294,59 @@ impl TransferContract {
             timing: false,
             linkability: true,
         };
-        let attestation = PrivacyAttestation {
-            level,
-            vk_id: cfg.vk_id,
-            root: root.clone(),
-        };
+        let attestation = PrivacyAttestation { level, vk_id: cfg.unshield_vk_id, root: root.clone() };
 
-        Withdrawn {
-            nullifier,
-            amount,
-        }
-        .publish(&env);
-        PrivacyAttested {
-            attestation: attestation.clone(),
-        }
-        .publish(&env);
+        Unshielded { nullifier, amount, change_index }.publish(&env);
+        PrivacyAttested { attestation: attestation.clone() }.publish(&env);
 
         Ok(attestation)
+    }
+
+    /// Fully-private transfer: spend one note, create two output notes. NO public
+    /// recipient address and NO public amount — only the nullifier and the two
+    /// output commitments are visible, plus opaque encrypted payloads for
+    /// recipient discovery. Permissionless / relayer-submittable.
+    pub fn transfer(
+        env: Env,
+        proof: Bytes,
+        root: BytesN<32>,
+        nullifier: BytesN<32>,
+        out_commitment_1: BytesN<32>,
+        out_commitment_2: BytesN<32>,
+        note_1: Bytes,
+        note_2: Bytes,
+    ) -> Result<(), Error> {
+        let cfg = load_config(&env)?;
+
+        let commitment = CommitmentClient::new(&env, &cfg.commitment);
+        if !commitment.is_known_root(&root) {
+            return Err(Error::UnknownRoot);
+        }
+        let nullifiers = NullifierClient::new(&env, &cfg.nullifier);
+        if nullifiers.is_spent(&nullifier) {
+            return Err(Error::NullifierAlreadySpent);
+        }
+
+        // Order must match the circuit: [root, nullifier, out_cm1, out_cm2].
+        let mut public_inputs: Vec<BytesN<32>> = Vec::new(&env);
+        public_inputs.push_back(root.clone());
+        public_inputs.push_back(nullifier.clone());
+        public_inputs.push_back(out_commitment_1.clone());
+        public_inputs.push_back(out_commitment_2.clone());
+
+        let verifier = VerifierClient::new(&env, &cfg.verifier);
+        if !verifier.verify(&cfg.transfer_vk_id, &proof, &public_inputs) {
+            return Err(Error::InvalidProof);
+        }
+
+        // ---- effects phase ----
+        nullifiers.mark_spent(&nullifier);
+        let out_index_1 = commitment.insert(&out_commitment_1);
+        let out_index_2 = commitment.insert(&out_commitment_2);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+
+        PrivateTransfer { nullifier, out_index_1, out_index_2, note_1, note_2 }.publish(&env);
+        Ok(())
     }
 }
 

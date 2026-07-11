@@ -4,10 +4,9 @@
 //! zero knowledge, that their note is a member of this tree without revealing
 //! which leaf it is.
 //!
-//! The leaf hashing function is isolated in [`hash_pair`] so it can be swapped
-//! for the circuit's hash. This scaffold uses keccak256 (always available in
-//! the Soroban host); production swaps in Poseidon2 (CAP-0075) so on-chain
-//! hashing matches the ZK circuit.
+//! The leaf hashing function is isolated in [`hash_pair`], which uses
+//! circom-compatible Poseidon over BLS12-381 (CAP-0075) so on-chain roots match
+//! the ZK membership circuit in `hypertron-prover`.
 #![no_std]
 
 use soroban_sdk::{
@@ -110,6 +109,10 @@ impl CommitmentContract {
         env.storage().instance().set(&Key::Authority, &authority);
         env.storage().instance().set(&Key::State, &state);
         env.storage().persistent().set(&Key::Root(0), &root);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&Key::Root(0), TTL_THRESHOLD, TTL_BUMP);
         Ok(())
     }
 
@@ -161,6 +164,10 @@ impl CommitmentContract {
         env.storage()
             .persistent()
             .extend_ttl(&Key::Leaf(leaf.clone()), TTL_THRESHOLD, TTL_BUMP);
+        env.storage()
+            .persistent()
+            .extend_ttl(&Key::Root(new_root_index), TTL_THRESHOLD, TTL_BUMP);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_BUMP);
 
         CommitInserted {
             index: leaf_index,
