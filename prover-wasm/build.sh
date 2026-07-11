@@ -26,6 +26,11 @@ wasm-pack build --release --target web    --out-dir "$OUT/web"  --out-name "$NAM
 echo "==> building nodejs target (CommonJS)"
 wasm-pack build --release --target nodejs --out-dir "$OUT/node" --out-name "$NAME"
 
+# wasm-pack writes a `.gitignore` containing `*` into each out-dir. npm pack
+# respects those files and would publish an empty package (README + package.json
+# only). Strip them so web/ and node/ actually ship.
+rm -f "$OUT/web/.gitignore" "$OUT/node/.gitignore"
+
 # The per-target package.json files that wasm-pack writes into web/ and node/
 # are kept on purpose: Node uses each subfolder's own manifest to pick the
 # correct module format (ESM vs CJS). Our unified manifest sits on top.
