@@ -1,24 +1,78 @@
 {
   "network": "testnet",
   "network_passphrase": "Test SDF Network ; September 2015",
-  "deployed_at": "2026-07-11",
+  "deployed_at": "2026-08-15",
   "admin": "GDBLMHECYDSYFTZZ3XSQTANPIMGBCTGIDTMTGLJ6IUBZO4ZS3PAJJEKD",
   "token": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
   "token_note": "Native XLM Stellar Asset Contract (SAC) on testnet",
   "contracts": {
-    "pool": "CBNJY2ULVHOSHCTA4ZBMCU7AEVZHK4J5D3UEWIRSUYTIAQXZNTYQAMJQ",
-    "commitment": "CBWKYBMQLK2XE4PPE2RPE6XV6IIZZEWQKUDQMVF4YZPFHIQ4Z3SYUCM5",
-    "nullifier": "CBSPL5JQCGMUEDIQPI2IIUN3WWTELI3KYNXELJYJBNTCNU5MKBOG3YDH",
-    "verifier": "CCQTSE4PBIDWRDO6NVAY7BPFW2EFF2STK7IL7MKB7XYJ5GKQCTJPOIFK",
+    "pool": "CB2SVTMGQKQVLUHWC5J7K5NOHPXULWEJL452B457NCRW7OKJ42XSVOLL",
+    "commitment": "CD7ZZPCQR7DDZHRNRDUFQ5PKSZK3KVPR3HXKO32NR5QNZWNH2ASVCMTQ",
+    "nullifier": "CCIZPBTVHFO6PCUB7APABIBSIJUUND2WVW6NSA2RBPCEOLUMASKF7KQD",
+    "verifier": "CCHSL7YSPSCT62DBUSCG4CKBJ2I4U4JSBR4RE3YIEGNSEUYXYY7BDIEP",
     "compliance": null
   },
   "vk_ids": {
     "deposit": 1,
     "unshield": 2,
-    "transfer": 3
+    "transfer": 3,
+    "transfer-2": 4,
+    "transfer-4": 5
   },
-  "setup": "DEV_SETUP=1 (local deterministic keys, seed=1). Not for production TVL.",
+  "setup": {
+    "kind": "single-coordinator",
+    "randomness": "OS CSPRNG (rand_core::OsRng); no seed material exists on disk",
+    "rotated_at": "2026-08-15",
+    "trust_assumption": "The coordinator who ran the setup could have retained the toxic waste and could forge proofs. This is NOT a multi-party ceremony. Mainnet requires the ceremony in docs/CEREMONY.md plus an external audit.",
+    "supersedes": "Keys generated before 2026-08-15 came from the public seed 1. Their toxic waste was reproducible by anyone from the repository, so proofs under them were forgeable by anyone. Those keys are retired and no longer registered on-chain. Pool, commitment, and nullifier were redeployed on 2026-08-15 for multi-input transfer (fresh Merkle tree). Verifier CCHSL7YS… was kept; VK ids 4 and 5 were registered on it."
+  },
+  "artifacts": {
+    "deposit": {
+      "vk_id": 1,
+      "public_inputs": 2,
+      "public_input_order": ["cm", "amount"],
+      "vk_sha256": "b9ee66dbf72e00344543dbfdf961ce0d4fd0a04960a281549c212c40ec276593",
+      "pk_sha256": "e6298d202bc2adfddca71852c0618eee75961414d39a54ccc7046dd26599e74c",
+      "registered_tx": "d4c418d5a03829e969454197d5beea10eedf51ee47b00d52f04d97d89d1b64f1"
+    },
+    "unshield": {
+      "vk_id": 2,
+      "public_inputs": 5,
+      "public_input_order": ["root", "nullifier", "recipient", "amount", "change_cm"],
+      "vk_sha256": "277fbcda56fb67ed4652a7c9829253a105377e27d3c4cdf272ec39c07e577414",
+      "pk_sha256": "e87b827477da9ba519ee073ad453f87ac19883b9bf249df9db95e68a366a80ae",
+      "registered_tx": "331bf6cac8bf4fc22b268e7f76ab7b196ffc1e42dbf05a972f3c7f3da7e91a87"
+    },
+    "transfer": {
+      "vk_id": 3,
+      "public_inputs": 4,
+      "public_input_order": ["root", "nullifier", "out_cm1", "out_cm2"],
+      "vk_sha256": "2baf06a2ed681b07d864b2ebe686624401c8047bb7a782b31367698647025cbc",
+      "pk_sha256": "93f01949aab2ca60b67b24306d9c9baa1931c351d1e8ca622e13a5ea3046bfa2",
+      "registered_tx": "ae7b17f54cc321816bbae76241ffe807392036201806ecd76aa0afa306e7e21b"
+    },
+    "transfer-2": {
+      "vk_id": 4,
+      "public_inputs": 5,
+      "public_input_order": ["root", "nf_1", "nf_2", "out_cm1", "out_cm2"],
+      "vk_sha256": "4a3611454f89c31daee5f0881ebfcb853a56d75449e2591f3b4d2bc538923274",
+      "pk_sha256": "c0c5b8c921f8a207cb68f6ee8fe30a0c27ee77682d9fa7d7570a2d71893a30b2",
+      "registered_tx": "5fed6018a16180512df7a5962f8823ab30039d717b36d1b88f4ed21ba1f39f9d"
+    },
+    "transfer-4": {
+      "vk_id": 5,
+      "public_inputs": 7,
+      "public_input_order": ["root", "nf_1", "nf_2", "nf_3", "nf_4", "out_cm1", "out_cm2"],
+      "vk_sha256": "a097d76c66d3221e58d1a07b2f5839cf10cd7ff4ea260a2b7eedddaa1f5e9c35",
+      "pk_sha256": "a3ddb7c9d0074623244dcb6599f318feacf2ace7755fcf654370ed1ae6c7d1c4",
+      "registered_tx": "66b20e8d0ad43ba8a5fdd1c35679f2a96f8018c4a6fd43a13e9f99745656bc3e"
+    }
+  },
+  "verification": {
+    "command": "./scripts/verify_deployment.sh",
+    "note": "Checks that the local artifacts hash to the values above, and that a freshly generated proof from each local proving key is accepted by the deployed verifier. A Groth16 pairing check cannot pass against an unrelated verifying key, so the second check confirms the on-chain keys without trusting this file or its author."
+  },
   "explorer": {
-    "pool": "https://lab.stellar.org/r/testnet/contract/CBNJY2ULVHOSHCTA4ZBMCU7AEVZHK4J5D3UEWIRSUYTIAQXZNTYQAMJQ"
+    "pool": "https://lab.stellar.org/r/testnet/contract/CB2SVTMGQKQVLUHWC5J7K5NOHPXULWEJL452B457NCRW7OKJ42XSVOLL"
   }
 }

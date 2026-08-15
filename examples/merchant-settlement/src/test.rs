@@ -57,6 +57,8 @@ fn merchant_collects_via_public_api() {
         deposit_vk_id: 1,
         unshield_vk_id: 2,
         transfer_vk_id: 3,
+        transfer_2in_vk_id: 4,
+        transfer_4in_vk_id: 5,
         compliance: None,
     });
 

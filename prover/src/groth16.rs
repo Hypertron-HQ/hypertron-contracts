@@ -13,7 +13,7 @@ use ark_groth16::{Groth16, Proof, ProvingKey, VerifyingKey};
 use ark_relations::r1cs::ConstraintSynthesizer;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_snark::SNARK;
-use ark_std::rand::{rngs::StdRng, SeedableRng};
+use ark_std::rand::{rngs::StdRng, CryptoRng, RngCore, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 /// Verifying key in the exact shape the `hypertron-verifier` contract stores,
@@ -25,6 +25,10 @@ pub struct VkJson {
     pub gamma: String,
     pub delta: String,
     pub ic: Vec<String>,
+    /// Present only when this key came from a reproducible development seed, so
+    /// that a forgeable key stays self-identifying wherever the file travels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insecure_dev_seed: Option<u64>,
 }
 
 /// A proof plus the public inputs it was bound to, ready to submit on-chain.
@@ -35,28 +39,45 @@ pub struct ProofJson {
     pub public_inputs: Vec<String>,
 }
 
+/// A circuit's Groth16 key pair, as produced by [`setup`].
+pub type Keys = (ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>);
+
 /// Run a Groth16 setup for any circuit shape.
 ///
-/// NOTE: this is a *local, deterministic* setup for development and testing.
-/// A production deployment must run a proper multi-party trusted-setup ceremony
-/// and publish the resulting verifying key (see `docs/ceremony.md`).
-pub fn setup<C: ConstraintSynthesizer<Fr>>(
+/// The caller supplies the randomness, and it determines the entire security of
+/// the resulting keys: whoever can reproduce this RNG stream can reconstruct the
+/// toxic waste and forge proofs. Pass `rand_core::OsRng` unless you are running
+/// a ceremony that supplies its own entropy. See `docs/CEREMONY.md`.
+pub fn setup<C: ConstraintSynthesizer<Fr>, R: RngCore + CryptoRng>(
     circuit: C,
-    seed: u64,
-) -> Result<(ProvingKey<Bls12_381>, VerifyingKey<Bls12_381>)> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(circuit, &mut rng)?;
+    rng: &mut R,
+) -> Result<Keys> {
+    let (pk, vk) = Groth16::<Bls12_381>::circuit_specific_setup(circuit, rng)?;
     Ok((pk, vk))
 }
 
 /// Produce a proof for a fully-assigned witness.
-pub fn prove<C: ConstraintSynthesizer<Fr>>(
+///
+/// The RNG supplies the `r, s` blinders that make the proof zero-knowledge. With
+/// reproducible randomness a proof becomes a deterministic function of its
+/// witness, so proofs of the same statement are byte-identical (linkable) and a
+/// guessed witness can be confirmed by recomputation. Pass `rand_core::OsRng`.
+pub fn prove<C: ConstraintSynthesizer<Fr>, R: RngCore + CryptoRng>(
     pk: &ProvingKey<Bls12_381>,
     circuit: C,
-    seed: u64,
+    rng: &mut R,
 ) -> Result<Proof<Bls12_381>> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    Ok(Groth16::<Bls12_381>::prove(pk, circuit, &mut rng)?)
+    Ok(Groth16::<Bls12_381>::prove(pk, circuit, rng)?)
+}
+
+/// Reproducible randomness from a 64-bit seed, for tests and for the explicitly
+/// opt-in development setup.
+///
+/// Keys or proofs produced from this are not secret: a 64-bit seed is search-
+/// able, and the well-known seeds used in tests are not secret at all. Never
+/// reachable from a default code path — every call site is a deliberate one.
+pub fn insecure_dev_rng(seed: u64) -> impl RngCore + CryptoRng {
+    StdRng::seed_from_u64(seed)
 }
 
 /// Off-chain sanity check (same pairing equation the contract runs on-chain).
@@ -96,6 +117,7 @@ pub fn vk_json(vk: &VerifyingKey<Bls12_381>) -> VkJson {
         gamma: hex::encode(g2_bytes(&vk.gamma_g2)),
         delta: hex::encode(g2_bytes(&vk.delta_g2)),
         ic: vk.gamma_abc_g1.iter().map(|p| hex::encode(g1_bytes(p))).collect(),
+        insecure_dev_seed: None,
     }
 }
 

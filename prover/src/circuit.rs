@@ -1,14 +1,20 @@
 //! The Hypertron transaction circuits.
 //!
-//! Value is carried by notes `cm = Poseidon(Poseidon(n,k), v)` (see [`crate::note`]).
-//! Three circuits cover the whole lifecycle, each with its own verifying key:
+//! Value is carried by notes `cm = Poseidon(Poseidon(owner_pk, k), v)` where
+//! `owner_pk = Poseidon(spend_sk, 0)` (see [`crate::note`]). Viewing-key blobs
+//! carry `(owner_pk, k, v)` only — the nullifier `Poseidon(spend_sk, k)` needs
+//! the spend key, so auditors who can decrypt cannot spend.
+//!
+//! Three circuits cover the lifecycle, each with its own verifying key:
 //!
 //! - [`DepositCircuit`] (shield): proves a deposited commitment opens to the
-//!   public `amount`, so a transparent deposit cannot mint a note worth more.
-//! - [`UnshieldCircuit`] (exit): proves membership + nullifier + value balance
-//!   `v_in = amount + v_change`, pays a public recipient, keeps a change note.
-//! - [`TransferCircuit`] (private 1-in / 2-out): membership + nullifier +
-//!   `v_in = v_out1 + v_out2`, with NO public address or amount — fully private.
+//!   public `amount` under some `owner_pk` (no spend key needed to *create*).
+//! - [`UnshieldCircuit`] (exit): membership + spend-key nullifier + value
+//!   balance `v_in = amount + v_change`.
+//! - [`TransferCircuit`] (private 1-in / 2-out): same spend-key nullifier,
+//!   `v_in = v_out1 + v_out2`, no public address or amount. VK id 3.
+//! - [`TransferNCircuit`] (private N-in / 2-out): same owner spend key, one
+//!   Merkle root, `sum(v_in) = v_out1 + v_out2`. VK id 4 = 2-in, VK id 5 = 4-in.
 //!
 //! Every value is range-checked to [`crate::note::VALUE_BITS`] so the balance
 //! equations cannot wrap the field and create value from nothing.
@@ -20,7 +26,7 @@ use ark_r1cs_std::{
 };
 use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
-use crate::note::VALUE_BITS;
+use crate::note::{OWNER_PK_DOMAIN, VALUE_BITS};
 use crate::poseidon::{hash2_var, mds_fr, rc_fr};
 
 /// Merkle tree depth. Must match the on-chain commitment tree.
@@ -39,8 +45,6 @@ fn witness(cs: &ConstraintSystemRef<Fr>, v: Option<Fr>) -> Result<FpVar<Fr>, Syn
 
 /// Enforce `0 <= value < 2^bits` via a bounded bit decomposition.
 fn range_check(value: &FpVar<Fr>, bits: usize) -> Result<(), SynthesisError> {
-    // `to_bits_le` returns the canonical (< modulus) little-endian bits and
-    // constrains them to equal `value`. Forcing the high bits to zero bounds it.
     let le = value.to_bits_le()?;
     for b in le.iter().skip(bits) {
         b.enforce_equal(&Boolean::constant(false))?;
@@ -48,22 +52,36 @@ fn range_check(value: &FpVar<Fr>, bits: usize) -> Result<(), SynthesisError> {
     Ok(())
 }
 
-/// In-circuit note commitment `cm = Poseidon(Poseidon(n, k), v)`.
+/// In-circuit note commitment `cm = Poseidon(Poseidon(owner_pk, k), v)`.
 fn note_commit(
-    n: &FpVar<Fr>,
+    owner_pk: &FpVar<Fr>,
     k: &FpVar<Fr>,
     v: &FpVar<Fr>,
     mds: &Mds,
     rc: &Rc,
 ) -> Result<FpVar<Fr>, SynthesisError> {
-    let inner = hash2_var(n, k, mds, rc)?;
+    let inner = hash2_var(owner_pk, k, mds, rc)?;
     hash2_var(&inner, v, mds, rc)
 }
 
-/// In-circuit nullifier `nf = Poseidon(n, 0)`.
-fn nullifier(n: &FpVar<Fr>, mds: &Mds, rc: &Rc) -> Result<FpVar<Fr>, SynthesisError> {
-    let zero = FpVar::constant(Fr::from(0u64));
-    hash2_var(n, &zero, mds, rc)
+/// `owner_pk = Poseidon(spend_sk, 0)`.
+fn owner_pk_var(
+    spend_sk: &FpVar<Fr>,
+    mds: &Mds,
+    rc: &Rc,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    let domain = FpVar::constant(Fr::from(OWNER_PK_DOMAIN));
+    hash2_var(spend_sk, &domain, mds, rc)
+}
+
+/// In-circuit nullifier `nf = Poseidon(spend_sk, k)`.
+fn nullifier_var(
+    spend_sk: &FpVar<Fr>,
+    k: &FpVar<Fr>,
+    mds: &Mds,
+    rc: &Rc,
+) -> Result<FpVar<Fr>, SynthesisError> {
+    hash2_var(spend_sk, k, mds, rc)
 }
 
 /// Walk a Merkle authentication path from `leaf` and return the computed root.
@@ -81,7 +99,6 @@ fn merkle_root(
         let bit = Boolean::new_witness(cs.clone(), || {
             path_bits[i].ok_or(SynthesisError::AssignmentMissing)
         })?;
-        // bit = 1 => current node is the right child.
         let left = FpVar::conditionally_select(&bit, &sib, &cur)?;
         let right = FpVar::conditionally_select(&bit, &cur, &sib)?;
         cur = hash2_var(&left, &right, mds, rc)?;
@@ -94,17 +111,23 @@ fn merkle_root(
 // ---------------------------------------------------------------------------
 
 /// Public inputs: `[cm, amount]`.
+/// Witnesses: `owner_pk`, `k` (no spend key — anyone may fund a known owner_pk).
 #[derive(Clone)]
 pub struct DepositCircuit {
     pub cm: Option<Fr>,
     pub amount: Option<Fr>,
-    pub n: Option<Fr>,
+    pub owner_pk: Option<Fr>,
     pub k: Option<Fr>,
 }
 
 impl DepositCircuit {
     pub fn empty() -> Self {
-        DepositCircuit { cm: None, amount: None, n: None, k: None }
+        DepositCircuit {
+            cm: None,
+            amount: None,
+            owner_pk: None,
+            k: None,
+        }
     }
 }
 
@@ -115,11 +138,11 @@ impl ConstraintSynthesizer<Fr> for DepositCircuit {
 
         let cm = input(&cs, self.cm)?;
         let amount = input(&cs, self.amount)?;
-        let n = witness(&cs, self.n)?;
+        let owner_pk = witness(&cs, self.owner_pk)?;
         let k = witness(&cs, self.k)?;
 
         range_check(&amount, VALUE_BITS)?;
-        let computed = note_commit(&n, &k, &amount, &mds, &rc)?;
+        let computed = note_commit(&owner_pk, &k, &amount, &mds, &rc)?;
         computed.enforce_equal(&cm)?;
         Ok(())
     }
@@ -137,14 +160,13 @@ pub struct UnshieldCircuit {
     pub recipient: Option<Fr>,
     pub amount: Option<Fr>,
     pub change_cm: Option<Fr>,
-    // input note
-    pub n: Option<Fr>,
+    // input note — spend key required
+    pub spend_sk: Option<Fr>,
     pub k: Option<Fr>,
     pub v: Option<Fr>,
     pub siblings: Vec<Option<Fr>>,
     pub path_bits: Vec<Option<bool>>,
-    // change note
-    pub n2: Option<Fr>,
+    // change note (same owner)
     pub k2: Option<Fr>,
     pub vc: Option<Fr>,
 }
@@ -157,12 +179,11 @@ impl UnshieldCircuit {
             recipient: None,
             amount: None,
             change_cm: None,
-            n: None,
+            spend_sk: None,
             k: None,
             v: None,
             siblings: vec![None; depth],
             path_bits: vec![None; depth],
-            n2: None,
             k2: None,
             vc: None,
         }
@@ -174,34 +195,30 @@ impl ConstraintSynthesizer<Fr> for UnshieldCircuit {
         let mds = mds_fr();
         let rc = rc_fr();
 
-        // Public, order = [root, nullifier, recipient, amount, change_cm].
         let root = input(&cs, self.root)?;
         let nf = input(&cs, self.nullifier)?;
         let recipient = input(&cs, self.recipient)?;
         let amount = input(&cs, self.amount)?;
         let change_cm = input(&cs, self.change_cm)?;
 
-        // Input note.
-        let n = witness(&cs, self.n)?;
+        let spend_sk = witness(&cs, self.spend_sk)?;
         let k = witness(&cs, self.k)?;
         let v = witness(&cs, self.v)?;
-        let cm = note_commit(&n, &k, &v, &mds, &rc)?;
+        let owner = owner_pk_var(&spend_sk, &mds, &rc)?;
+        let cm = note_commit(&owner, &k, &v, &mds, &rc)?;
         let computed_root = merkle_root(&cs, cm, &self.siblings, &self.path_bits, &mds, &rc)?;
         computed_root.enforce_equal(&root)?;
-        nullifier(&n, &mds, &rc)?.enforce_equal(&nf)?;
+        nullifier_var(&spend_sk, &k, &mds, &rc)?.enforce_equal(&nf)?;
 
-        // Change note stays in the pool.
-        let n2 = witness(&cs, self.n2)?;
+        // Change note stays in the pool, still owned by the same spend key.
         let k2 = witness(&cs, self.k2)?;
         let vc = witness(&cs, self.vc)?;
-        note_commit(&n2, &k2, &vc, &mds, &rc)?.enforce_equal(&change_cm)?;
+        note_commit(&owner, &k2, &vc, &mds, &rc)?.enforce_equal(&change_cm)?;
 
-        // Value conservation: v = amount + change. Range checks stop field wrap.
         range_check(&amount, VALUE_BITS)?;
         range_check(&vc, VALUE_BITS)?;
         (&amount + &vc).enforce_equal(&v)?;
 
-        // Bind recipient into the constraint system (Groth16 public-input binding).
         let _ = &recipient * &recipient;
         Ok(())
     }
@@ -219,16 +236,16 @@ pub struct TransferCircuit {
     pub out_cm1: Option<Fr>,
     pub out_cm2: Option<Fr>,
     // input note
-    pub n: Option<Fr>,
+    pub spend_sk: Option<Fr>,
     pub k: Option<Fr>,
     pub v: Option<Fr>,
     pub siblings: Vec<Option<Fr>>,
     pub path_bits: Vec<Option<bool>>,
-    // output notes
-    pub n1: Option<Fr>,
+    // output notes: owner_pk (recipient / self) + k + v
+    pub owner_pk1: Option<Fr>,
     pub k1: Option<Fr>,
     pub v1: Option<Fr>,
-    pub n2: Option<Fr>,
+    pub owner_pk2: Option<Fr>,
     pub k2: Option<Fr>,
     pub v2: Option<Fr>,
 }
@@ -240,15 +257,15 @@ impl TransferCircuit {
             nullifier: None,
             out_cm1: None,
             out_cm2: None,
-            n: None,
+            spend_sk: None,
             k: None,
             v: None,
             siblings: vec![None; depth],
             path_bits: vec![None; depth],
-            n1: None,
+            owner_pk1: None,
             k1: None,
             v1: None,
-            n2: None,
+            owner_pk2: None,
             k2: None,
             v2: None,
         }
@@ -260,36 +277,144 @@ impl ConstraintSynthesizer<Fr> for TransferCircuit {
         let mds = mds_fr();
         let rc = rc_fr();
 
-        // Public, order = [root, nullifier, out_cm1, out_cm2].
         let root = input(&cs, self.root)?;
         let nf = input(&cs, self.nullifier)?;
         let out_cm1 = input(&cs, self.out_cm1)?;
         let out_cm2 = input(&cs, self.out_cm2)?;
 
-        // Input note.
-        let n = witness(&cs, self.n)?;
+        let spend_sk = witness(&cs, self.spend_sk)?;
         let k = witness(&cs, self.k)?;
         let v = witness(&cs, self.v)?;
-        let cm = note_commit(&n, &k, &v, &mds, &rc)?;
+        let owner = owner_pk_var(&spend_sk, &mds, &rc)?;
+        let cm = note_commit(&owner, &k, &v, &mds, &rc)?;
         let computed_root = merkle_root(&cs, cm, &self.siblings, &self.path_bits, &mds, &rc)?;
         computed_root.enforce_equal(&root)?;
-        nullifier(&n, &mds, &rc)?.enforce_equal(&nf)?;
+        nullifier_var(&spend_sk, &k, &mds, &rc)?.enforce_equal(&nf)?;
 
-        // Output notes (recipient + change), both stay in the pool.
-        let n1 = witness(&cs, self.n1)?;
+        let owner_pk1 = witness(&cs, self.owner_pk1)?;
         let k1 = witness(&cs, self.k1)?;
         let v1 = witness(&cs, self.v1)?;
-        note_commit(&n1, &k1, &v1, &mds, &rc)?.enforce_equal(&out_cm1)?;
+        note_commit(&owner_pk1, &k1, &v1, &mds, &rc)?.enforce_equal(&out_cm1)?;
 
-        let n2 = witness(&cs, self.n2)?;
+        let owner_pk2 = witness(&cs, self.owner_pk2)?;
         let k2 = witness(&cs, self.k2)?;
         let v2 = witness(&cs, self.v2)?;
-        note_commit(&n2, &k2, &v2, &mds, &rc)?.enforce_equal(&out_cm2)?;
+        note_commit(&owner_pk2, &k2, &v2, &mds, &rc)?.enforce_equal(&out_cm2)?;
 
-        // Value conservation with range checks on the outputs.
         range_check(&v1, VALUE_BITS)?;
         range_check(&v2, VALUE_BITS)?;
         (&v1 + &v2).enforce_equal(&v)?;
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Transfer N-in / 2-out — separate circuit per N (no dummy padding).
+// Public inputs: `[root, nf_1, …, nf_N, out_cm1, out_cm2]`.
+// ---------------------------------------------------------------------------
+
+/// One spent input of an N-in transfer. All inputs share one `spend_sk` and
+/// prove membership against the same Merkle root.
+#[derive(Clone)]
+pub struct TransferInput {
+    pub k: Option<Fr>,
+    pub v: Option<Fr>,
+    pub nullifier: Option<Fr>,
+    pub siblings: Vec<Option<Fr>>,
+    pub path_bits: Vec<Option<bool>>,
+}
+
+impl TransferInput {
+    pub fn empty(depth: usize) -> Self {
+        TransferInput {
+            k: None,
+            v: None,
+            nullifier: None,
+            siblings: vec![None; depth],
+            path_bits: vec![None; depth],
+        }
+    }
+}
+
+/// Private N-in / 2-out transfer. `N` is the number of spent notes; there is
+/// no dummy-input padding, so proving time scales with the payment's arity.
+#[derive(Clone)]
+pub struct TransferNCircuit<const N: usize> {
+    pub root: Option<Fr>,
+    pub out_cm1: Option<Fr>,
+    pub out_cm2: Option<Fr>,
+    pub spend_sk: Option<Fr>,
+    pub inputs: [TransferInput; N],
+    pub owner_pk1: Option<Fr>,
+    pub k1: Option<Fr>,
+    pub v1: Option<Fr>,
+    pub owner_pk2: Option<Fr>,
+    pub k2: Option<Fr>,
+    pub v2: Option<Fr>,
+}
+
+pub type Transfer2Circuit = TransferNCircuit<2>;
+pub type Transfer4Circuit = TransferNCircuit<4>;
+
+impl<const N: usize> TransferNCircuit<N> {
+    pub fn empty(depth: usize) -> Self {
+        TransferNCircuit {
+            root: None,
+            out_cm1: None,
+            out_cm2: None,
+            spend_sk: None,
+            inputs: core::array::from_fn(|_| TransferInput::empty(depth)),
+            owner_pk1: None,
+            k1: None,
+            v1: None,
+            owner_pk2: None,
+            k2: None,
+            v2: None,
+        }
+    }
+}
+
+impl<const N: usize> ConstraintSynthesizer<Fr> for TransferNCircuit<N> {
+    fn generate_constraints(self, cs: ConstraintSystemRef<Fr>) -> Result<(), SynthesisError> {
+        let mds = mds_fr();
+        let rc = rc_fr();
+
+        let root = input(&cs, self.root)?;
+        let mut nfs = Vec::with_capacity(N);
+        for inp in &self.inputs {
+            nfs.push(input(&cs, inp.nullifier)?);
+        }
+        let out_cm1 = input(&cs, self.out_cm1)?;
+        let out_cm2 = input(&cs, self.out_cm2)?;
+
+        let spend_sk = witness(&cs, self.spend_sk)?;
+        let owner = owner_pk_var(&spend_sk, &mds, &rc)?;
+
+        let mut v_sum = FpVar::<Fr>::zero();
+        for (inp, nf) in self.inputs.into_iter().zip(nfs.into_iter()) {
+            let k = witness(&cs, inp.k)?;
+            let v = witness(&cs, inp.v)?;
+            range_check(&v, VALUE_BITS)?;
+            let cm = note_commit(&owner, &k, &v, &mds, &rc)?;
+            let computed_root = merkle_root(&cs, cm, &inp.siblings, &inp.path_bits, &mds, &rc)?;
+            computed_root.enforce_equal(&root)?;
+            nullifier_var(&spend_sk, &k, &mds, &rc)?.enforce_equal(&nf)?;
+            v_sum += v;
+        }
+
+        let owner_pk1 = witness(&cs, self.owner_pk1)?;
+        let k1 = witness(&cs, self.k1)?;
+        let v1 = witness(&cs, self.v1)?;
+        note_commit(&owner_pk1, &k1, &v1, &mds, &rc)?.enforce_equal(&out_cm1)?;
+
+        let owner_pk2 = witness(&cs, self.owner_pk2)?;
+        let k2 = witness(&cs, self.k2)?;
+        let v2 = witness(&cs, self.v2)?;
+        note_commit(&owner_pk2, &k2, &v2, &mds, &rc)?.enforce_equal(&out_cm2)?;
+
+        range_check(&v1, VALUE_BITS)?;
+        range_check(&v2, VALUE_BITS)?;
+        (&v1 + &v2).enforce_equal(&v_sum)?;
         Ok(())
     }
 }

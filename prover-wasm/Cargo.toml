@@ -21,8 +21,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 
-# WASM randomness: the `js` feature routes getrandom through the browser/Node
-# crypto API. It is a no-op on native targets.
+# Proof randomness (Groth16 r, s blinders) comes from OsRng.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# DO NOT REMOVE: nothing in this crate calls getrandom directly, so it looks
+# unused. It is here to enable the `js` feature, which is what routes OsRng
+# through the browser/Node crypto API on wasm32-unknown-unknown. Without it the
+# wasm build compiles and then panics at runtime on the first proof.
 getrandom = { version = "0.2", features = ["js"] }
 
 console_error_panic_hook = { version = "0.1", optional = true }

@@ -9,16 +9,16 @@
 //! Scheme (ECIES-style, X25519 + ChaCha20-Poly1305):
 //!
 //! ```text
-//! recipient meta-address = (spend_pub, view_pub)      // published once
+//! recipient meta-address = (spend_pub=owner_pk, view_pub)  // published once
 //! per note:  eph = random x25519;  s = ECDH(eph, view_pub)
 //!            key = SHA-256("hypertron:note:v1" || s)
-//!            ct  = ChaCha20Poly1305(key, nonce=0, plaintext = n||k||v)
+//!            ct  = ChaCha20Poly1305(key, nonce=0, plaintext = owner_pk||k||v)
 //!            blob = eph_pub (32) || ct
 //! ```
 //!
-//! The recipient (or an auditor with the view key) recomputes
-//! `s = ECDH(view_secret, eph_pub)` and decrypts. Spending still requires the
-//! separate spend key, so a viewing key is read-only authority.
+//! The plaintext deliberately omits `spend_sk`. Decrypting yields enough to
+//! verify the commitment and read the amount; producing a nullifier still
+//! requires the separate spend key (`nf = Poseidon(spend_sk, k)`).
 
 use anyhow::{anyhow, Result};
 use ark_bls12_381::Fr;
@@ -89,6 +89,7 @@ fn kdf(shared: &[u8; 32]) -> [u8; 32] {
 
 /// Encrypt a note to a recipient's viewing public key. Returns the on-chain
 /// blob `eph_pub (32) || ciphertext` to emit alongside the commitment.
+/// Plaintext is `owner_pk || k || v` — never the spend secret.
 pub fn encrypt_note(recipient: &ViewingPubKey, note: &Note) -> Vec<u8> {
     let mut eph_seed = [0u8; 32];
     OsRng.fill_bytes(&mut eph_seed);
@@ -100,7 +101,7 @@ pub fn encrypt_note(recipient: &ViewingPubKey, note: &Note) -> Vec<u8> {
     let cipher = ChaCha20Poly1305::new((&key).into());
 
     let mut plaintext = Vec::with_capacity(96);
-    plaintext.extend_from_slice(&fr_be32(&note.n));
+    plaintext.extend_from_slice(&fr_be32(&note.owner_pk));
     plaintext.extend_from_slice(&fr_be32(&note.k));
     plaintext.extend_from_slice(&fr_be32(&note.v));
 
@@ -136,7 +137,7 @@ pub fn decrypt_note(vk: &ViewingKey, blob: &[u8]) -> Result<Note> {
         return Err(anyhow!("unexpected plaintext length {}", pt.len()));
     }
     Ok(Note {
-        n: Fr::from_be_bytes_mod_order(&pt[0..32]),
+        owner_pk: Fr::from_be_bytes_mod_order(&pt[0..32]),
         k: Fr::from_be_bytes_mod_order(&pt[32..64]),
         v: Fr::from_be_bytes_mod_order(&pt[64..96]),
     })
@@ -145,14 +146,18 @@ pub fn decrypt_note(vk: &ViewingKey, blob: &[u8]) -> Result<Note> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::note::{nullifier, owner_pk};
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
         let vk = ViewingKey::generate();
-        let note = Note::new(Fr::from(11u64), Fr::from(22u64), Fr::from(1_000u64));
+        let spend_sk = Fr::from(99u64);
+        let note = Note::from_spend_key(spend_sk, Fr::from(22u64), Fr::from(1_000u64));
         let blob = encrypt_note(&vk.public(), &note);
         let got = decrypt_note(&vk, &blob).unwrap();
         assert_eq!(got, note);
+        // Viewing decrypt does not yield a spendable nullifier without spend_sk.
+        assert_ne!(nullifier(spend_sk, note.k), owner_pk(got.owner_pk));
     }
 
     #[test]
@@ -162,5 +167,17 @@ mod tests {
         let note = Note::new(Fr::from(1u64), Fr::from(2u64), Fr::from(3u64));
         let blob = encrypt_note(&vk.public(), &note);
         assert!(decrypt_note(&other, &blob).is_err());
+    }
+
+    #[test]
+    fn auditor_cannot_derive_nullifier_from_blob() {
+        let vk = ViewingKey::generate();
+        let spend_sk = Fr::from(0xdead_beef_u64);
+        let note = Note::from_spend_key(spend_sk, Fr::from(7u64), Fr::from(100u64));
+        let blob = encrypt_note(&vk.public(), &note);
+        let opened = decrypt_note(&vk, &blob).unwrap();
+        // The "nullifier" you'd get by mistakenly hashing owner_pk is wrong.
+        let fake = crate::poseidon::poseidon2to1(opened.owner_pk, Fr::from(0u64));
+        assert_ne!(fake, nullifier(spend_sk, opened.k));
     }
 }
