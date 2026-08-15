@@ -12,7 +12,10 @@ use ark_ff::{BigInteger, PrimeField};
 use ark_serialize::CanonicalSerialize;
 use ark_std::vec;
 
-use hypertron_prover::circuit::{DepositCircuit, TransferCircuit, UnshieldCircuit, DEPTH};
+use hypertron_prover::circuit::{
+    DepositCircuit, Transfer2Circuit, Transfer4Circuit, TransferCircuit, TransferInput,
+    UnshieldCircuit, DEPTH,
+};
 use hypertron_prover::note::Note;
 use hypertron_prover::{groth16, merkle};
 
@@ -199,6 +202,8 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
         deposit_vk_id: 1,
         unshield_vk_id: 2,
         transfer_vk_id: 3,
+        transfer_2in_vk_id: 4,
+        transfer_4in_vk_id: 5,
         compliance: None,
     });
     let tree = CommitmentContractClient::new(&env, &commitment_id);
@@ -353,4 +358,235 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
         &empty,
     );
     assert!(bad.is_err());
+}
+
+fn deposit_note(
+    env: &Env,
+    pool: &hypertron_transfer::TransferContractClient,
+    depositor: &Address,
+    deposit_pk: &ark_groth16::ProvingKey<Bls12_381>,
+    note: &Note,
+    amount: i128,
+    rng_seed: u64,
+) {
+    let deposit_proof = groth16::prove(
+        deposit_pk,
+        DepositCircuit {
+            cm: Some(note.commitment()),
+            amount: Some(note.v),
+            owner_pk: Some(note.owner_pk),
+            k: Some(note.k),
+        },
+        &mut groth16::insecure_dev_rng(rng_seed),
+    )
+    .unwrap();
+    pool.deposit(
+        depositor,
+        &amount,
+        &fr_to_bytesn(env, &note.commitment()),
+        &proof_to_bytes(env, &deposit_proof),
+    );
+}
+
+fn transfer_n_inputs<const N: usize>(
+    spend_sk: Fr,
+    notes: &[Note],
+    leaves: &[Fr],
+    indices: &[usize],
+) -> ([TransferInput; N], Fr, [Fr; N]) {
+    assert_eq!(notes.len(), N);
+    assert_eq!(indices.len(), N);
+    let mut nfs = [Fr::from(0u64); N];
+    let mut inputs: [TransferInput; N] =
+        core::array::from_fn(|_| TransferInput::empty(DEPTH));
+    let mut root = Fr::from(0u64);
+    for i in 0..N {
+        let (r, siblings, path_bits) = merkle::path(leaves, indices[i], DEPTH);
+        if i == 0 {
+            root = r;
+        } else {
+            assert_eq!(root, r);
+        }
+        nfs[i] = notes[i].nullifier(spend_sk);
+        inputs[i] = TransferInput {
+            k: Some(notes[i].k),
+            v: Some(notes[i].v),
+            nullifier: Some(nfs[i]),
+            siblings: siblings.into_iter().map(Some).collect(),
+            path_bits: path_bits.into_iter().map(Some).collect(),
+        };
+    }
+    (inputs, root, nfs)
+}
+
+/// 2-in and 4-in private transfers with real Groth16 proofs against the pool.
+#[test]
+fn multi_input_transfer_with_real_proofs() {
+    use hypertron_commitment::{CommitmentContract, CommitmentContractClient};
+    use hypertron_nullifier::{NullifierContract, NullifierContractClient};
+    use hypertron_transfer::{Config, TransferContract, TransferContractClient};
+    use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
+
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    env.cost_estimate().budget().reset_unlimited();
+
+    let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
+    let token = sac.address();
+    let token_admin = StellarAssetClient::new(&env, &token);
+
+    let commitment_id = env.register(CommitmentContract, ());
+    let nullifier_id = env.register(NullifierContract, ());
+    let verifier_id = env.register(VerifierContract, ());
+    let transfer_id = env.register(TransferContract, ());
+
+    CommitmentContractClient::new(&env, &commitment_id).initialize(&transfer_id);
+    NullifierContractClient::new(&env, &nullifier_id).initialize(&transfer_id);
+
+    let (deposit_pk, deposit_vk) =
+        groth16::setup(DepositCircuit::empty(), &mut groth16::insecure_dev_rng(1)).unwrap();
+    let (t2_pk, t2_vk) =
+        groth16::setup(Transfer2Circuit::empty(DEPTH), &mut groth16::insecure_dev_rng(4)).unwrap();
+    let (t4_pk, t4_vk) =
+        groth16::setup(Transfer4Circuit::empty(DEPTH), &mut groth16::insecure_dev_rng(5)).unwrap();
+
+    let verifier = VerifierContractClient::new(&env, &verifier_id);
+    verifier.initialize(&Address::generate(&env));
+    verifier.register_vk(&1, &to_soroban_vk(&env, &deposit_vk));
+    verifier.register_vk(&4, &to_soroban_vk(&env, &t2_vk));
+    verifier.register_vk(&5, &to_soroban_vk(&env, &t4_vk));
+
+    let pool = TransferContractClient::new(&env, &transfer_id);
+    pool.initialize(&Config {
+        token: token.clone(),
+        commitment: commitment_id.clone(),
+        nullifier: nullifier_id.clone(),
+        verifier: verifier_id.clone(),
+        deposit_vk_id: 1,
+        unshield_vk_id: 2,
+        transfer_vk_id: 3,
+        transfer_2in_vk_id: 4,
+        transfer_4in_vk_id: 5,
+        compliance: None,
+    });
+    let tree = CommitmentContractClient::new(&env, &commitment_id);
+
+    let depositor = Address::generate(&env);
+    token_admin.mint(&depositor, &10_000);
+    let spend_sk = Fr::from(424242u64);
+    let empty = Bytes::new(&env);
+    let mut leaves = vec![];
+
+    // ---- 2-in: notes 40 + 60 -> 70 + 30 ------------------------------------
+    let n0 = Note::from_spend_key(spend_sk, Fr::from(1u64), Fr::from(40u64));
+    let n1 = Note::from_spend_key(spend_sk, Fr::from(2u64), Fr::from(60u64));
+    deposit_note(&env, &pool, &depositor, &deposit_pk, &n0, 40, 21);
+    leaves.push(n0.commitment());
+    deposit_note(&env, &pool, &depositor, &deposit_pk, &n1, 60, 22);
+    leaves.push(n1.commitment());
+
+    let out1 = Note::new(Fr::from(101u64), Fr::from(102u64), Fr::from(70u64));
+    let out2 = Note::new(Fr::from(201u64), Fr::from(202u64), Fr::from(30u64));
+    let (inputs, root, nfs) = transfer_n_inputs::<2>(spend_sk, &[n0, n1], &leaves, &[0, 1]);
+    assert_eq!(root, bytesn_to_fr(&tree.root()));
+    let proof = groth16::prove(
+        &t2_pk,
+        Transfer2Circuit {
+            root: Some(root),
+            out_cm1: Some(out1.commitment()),
+            out_cm2: Some(out2.commitment()),
+            spend_sk: Some(spend_sk),
+            inputs,
+            owner_pk1: Some(out1.owner_pk),
+            k1: Some(out1.k),
+            v1: Some(out1.v),
+            owner_pk2: Some(out2.owner_pk),
+            k2: Some(out2.k),
+            v2: Some(out2.v),
+        },
+        &mut groth16::insecure_dev_rng(24),
+    )
+    .unwrap();
+    let mut nf_vec: SVec<BytesN<32>> = SVec::new(&env);
+    nf_vec.push_back(fr_to_bytesn(&env, &nfs[0]));
+    nf_vec.push_back(fr_to_bytesn(&env, &nfs[1]));
+    pool.transfer_n(
+        &proof_to_bytes(&env, &proof),
+        &tree.root(),
+        &nf_vec,
+        &fr_to_bytesn(&env, &out1.commitment()),
+        &fr_to_bytesn(&env, &out2.commitment()),
+        &empty,
+        &empty,
+    );
+    leaves.push(out1.commitment());
+    leaves.push(out2.commitment());
+    assert_eq!(tree.size(), 4);
+    assert_eq!(TokenClient::new(&env, &token).balance(&transfer_id), 100);
+
+    // Replay of either 2-in nullifier is rejected.
+    assert!(pool
+        .try_transfer_n(
+            &proof_to_bytes(&env, &proof),
+            &tree.root(),
+            &nf_vec,
+            &fr_to_bytesn(&env, &out1.commitment()),
+            &fr_to_bytesn(&env, &out2.commitment()),
+            &empty,
+            &empty,
+        )
+        .is_err());
+
+    // ---- 4-in: 10+20+30+40 = 70+30 -----------------------------------------
+    let four: [Note; 4] = core::array::from_fn(|i| {
+        Note::from_spend_key(
+            spend_sk,
+            Fr::from(50 + i as u64),
+            Fr::from(10 * (i as u64 + 1)),
+        )
+    });
+    let start = leaves.len();
+    for (i, note) in four.iter().enumerate() {
+        let amt = 10 * (i as i128 + 1);
+        deposit_note(&env, &pool, &depositor, &deposit_pk, note, amt, 30 + i as u64);
+        leaves.push(note.commitment());
+    }
+    let out1 = Note::new(Fr::from(301u64), Fr::from(302u64), Fr::from(70u64));
+    let out2 = Note::new(Fr::from(401u64), Fr::from(402u64), Fr::from(30u64));
+    let idxs = [start, start + 1, start + 2, start + 3];
+    let (inputs, root, nfs) = transfer_n_inputs::<4>(spend_sk, &four, &leaves, &idxs);
+    assert_eq!(root, bytesn_to_fr(&tree.root()));
+    let proof = groth16::prove(
+        &t4_pk,
+        Transfer4Circuit {
+            root: Some(root),
+            out_cm1: Some(out1.commitment()),
+            out_cm2: Some(out2.commitment()),
+            spend_sk: Some(spend_sk),
+            inputs,
+            owner_pk1: Some(out1.owner_pk),
+            k1: Some(out1.k),
+            v1: Some(out1.v),
+            owner_pk2: Some(out2.owner_pk),
+            k2: Some(out2.k),
+            v2: Some(out2.v),
+        },
+        &mut groth16::insecure_dev_rng(34),
+    )
+    .unwrap();
+    let mut nf_vec: SVec<BytesN<32>> = SVec::new(&env);
+    for nf in &nfs {
+        nf_vec.push_back(fr_to_bytesn(&env, nf));
+    }
+    pool.transfer_n(
+        &proof_to_bytes(&env, &proof),
+        &tree.root(),
+        &nf_vec,
+        &fr_to_bytesn(&env, &out1.commitment()),
+        &fr_to_bytesn(&env, &out2.commitment()),
+        &empty,
+        &empty,
+    );
+    assert_eq!(tree.size(), 10);
+    assert_eq!(TokenClient::new(&env, &token).balance(&transfer_id), 200);
 }

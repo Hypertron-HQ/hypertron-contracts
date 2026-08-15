@@ -50,6 +50,8 @@ JSON **string** whose fields line up 1:1 with the contract call arguments.
 | `deposit_proof(pk, params)` | yes | `{ commitment, proof, public_inputs }` |
 | `unshield_proof(pk, params)` | yes | `{ root, nullifier, change_cm, proof, public_inputs }` |
 | `transfer_proof(pk, params)` | yes | `{ root, nullifier, out_cm1, out_cm2, proof, public_inputs, recipient_blob?, change_blob? }` |
+| `transfer_2_proof(pk, params)` | yes | `{ root, nullifiers, out_cm1, out_cm2, proof, public_inputs, recipient_blob?, change_blob? }` |
+| `transfer_4_proof(pk, params)` | yes | `{ root, nullifiers, out_cm1, out_cm2, proof, public_inputs, recipient_blob?, change_blob? }` |
 
 `params` is a JSON string. `spend_sk` is required only for spending proofs and
 is never included in encrypted note blobs:
@@ -57,6 +59,7 @@ is never included in encrypted note blobs:
 - **deposit**: `{ owner_pk, k, amount }`
 - **unshield**: `{ spend_sk, k, v, index, leaves: ["0x…"], recipient_field, amount, change_k, depth? }`
 - **transfer**: `{ spend_sk, k, v, index, leaves, out1_owner_pk, out1_k, out1_v, out2_owner_pk, out2_k, out2_v, recipient_view?, self_view?, depth? }`
+- **transfer-2 / transfer-4**: `{ spend_sk, inputs: [{ k, v, index }, …], leaves, out1_owner_pk, out1_k, out1_v, out2_owner_pk, out2_k, out2_v, recipient_view?, self_view?, depth? }` (`inputs` length 2 or 4)
 
 Proof randomness is drawn from the platform CSPRNG and is not configurable. The
 proof functions previously accepted a `seed`; a fixed seed makes a Groth16 proof

@@ -19,8 +19,10 @@
 //!     into a Stellar SDK `invoke`:
 //!       deposit  -> { commitment, proof, public_inputs }
 //!       unshield -> { root, nullifier, change_cm, proof, public_inputs }
-//!       transfer -> { root, nullifier, out_cm1, out_cm2, proof,
-//!                     public_inputs, recipient_blob?, change_blob? }
+//!       transfer   -> { root, nullifier, out_cm1, out_cm2, proof,
+//!                       public_inputs, recipient_blob?, change_blob? }
+//!       transfer_n -> { root, nullifiers, out_cm1, out_cm2, proof,
+//!                       public_inputs, recipient_blob?, change_blob? }
 //!   - Amounts/values are passed as decimal strings (JS numbers are unsafe past
 //!     2^53); field elements accept decimal or `0x` hex.
 
@@ -30,7 +32,9 @@ use rand_core::OsRng;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
-use hypertron_prover::circuit::{DepositCircuit, TransferCircuit, UnshieldCircuit, DEPTH};
+use hypertron_prover::circuit::{
+    DepositCircuit, TransferCircuit, TransferInput, TransferNCircuit, UnshieldCircuit, DEPTH,
+};
 use hypertron_prover::crypto::{decrypt_note, encrypt_note, ViewingKey, ViewingPubKey};
 use hypertron_prover::note::Note;
 use hypertron_prover::{groth16, merkle, note, parse_bytes32, parse_fr};
@@ -364,4 +368,156 @@ pub fn transfer_proof(pk: &[u8], params_json: &str) -> Result<String, JsError> {
         out["change_blob"] = serde_json::Value::String(format!("0x{}", hex::encode(blob)));
     }
     Ok(out.to_string())
+}
+
+#[derive(Deserialize)]
+struct TransferNNote {
+    k: String,
+    v: String,
+    index: usize,
+}
+
+#[derive(Deserialize)]
+struct TransferNParams {
+    spend_sk: String,
+    inputs: Vec<TransferNNote>,
+    leaves: Vec<String>,
+    #[serde(alias = "out1_n")]
+    out1_owner_pk: String,
+    out1_k: String,
+    out1_v: String,
+    #[serde(alias = "out2_n")]
+    out2_owner_pk: String,
+    out2_k: String,
+    out2_v: String,
+    recipient_view: Option<String>,
+    self_view: Option<String>,
+    depth: Option<usize>,
+}
+
+fn transfer_n_proof<const N: usize>(pk: &[u8], params_json: &str) -> Result<String, JsError> {
+    let p: TransferNParams = serde_json::from_str(params_json).map_err(err)?;
+    if p.inputs.len() != N {
+        return Err(JsError::new(&format!(
+            "expected {N} inputs, got {}",
+            p.inputs.len()
+        )));
+    }
+    let pk = groth16::pk_from_bytes(pk).map_err(err)?;
+    let depth = p.depth.unwrap_or(DEPTH);
+    let out1_v = u128s(&p.out1_v)?;
+    let out2_v = u128s(&p.out2_v)?;
+    let mut in_sum: u128 = 0;
+    let mut vs = Vec::with_capacity(N);
+    for inp in &p.inputs {
+        let v = u128s(&inp.v)?;
+        in_sum = in_sum
+            .checked_add(v)
+            .ok_or_else(|| JsError::new("input value overflow"))?;
+        vs.push(v);
+    }
+    if out1_v + out2_v != in_sum {
+        return Err(JsError::new("outputs must equal input value sum"));
+    }
+
+    let spend_sk = fr(&p.spend_sk)?;
+    let leaf_frs = leaves_to_fr(&p.leaves)?;
+    let mut notes = Vec::with_capacity(N);
+    for i in 0..N {
+        let note = Note::from_spend_key(spend_sk, fr(&p.inputs[i].k)?, Fr::from(vs[i]));
+        let idx = p.inputs[i].index;
+        if idx >= leaf_frs.len() || leaf_frs[idx] != note.commitment() {
+            return Err(JsError::new(&format!(
+                "leaf at index {idx} does not match input {i}"
+            )));
+        }
+        notes.push(note);
+    }
+
+    let mut inputs_c: [TransferInput; N] =
+        core::array::from_fn(|_| TransferInput::empty(depth));
+    let mut nfs = Vec::with_capacity(N);
+    let mut root_opt: Option<Fr> = None;
+    for i in 0..N {
+        let (root, siblings, path_bits) = merkle::path(&leaf_frs, p.inputs[i].index, depth);
+        match root_opt {
+            None => root_opt = Some(root),
+            Some(r) if r != root => {
+                return Err(JsError::new("inputs do not share a Merkle root"));
+            }
+            _ => {}
+        }
+        let nf = notes[i].nullifier(spend_sk);
+        nfs.push(nf);
+        inputs_c[i] = TransferInput {
+            k: Some(notes[i].k),
+            v: Some(notes[i].v),
+            nullifier: Some(nf),
+            siblings: siblings.into_iter().map(Some).collect(),
+            path_bits: path_bits.into_iter().map(Some).collect(),
+        };
+    }
+    let root = root_opt.ok_or_else(|| JsError::new("no inputs"))?;
+    let out1 = Note::new(fr(&p.out1_owner_pk)?, fr(&p.out1_k)?, Fr::from(out1_v));
+    let out2 = Note::new(fr(&p.out2_owner_pk)?, fr(&p.out2_k)?, Fr::from(out2_v));
+
+    let circuit = TransferNCircuit::<N> {
+        root: Some(root),
+        out_cm1: Some(out1.commitment()),
+        out_cm2: Some(out2.commitment()),
+        spend_sk: Some(spend_sk),
+        inputs: inputs_c,
+        owner_pk1: Some(out1.owner_pk),
+        k1: Some(out1.k),
+        v1: Some(out1.v),
+        owner_pk2: Some(out2.owner_pk),
+        k2: Some(out2.k),
+        v2: Some(out2.v),
+    };
+    let proof = groth16::prove(&pk, circuit, &mut OsRng).map_err(err)?;
+    let mut publics = vec![root];
+    publics.extend(nfs.iter().copied());
+    publics.push(out1.commitment());
+    publics.push(out2.commitment());
+    if !groth16::verify(&pk.vk, &publics, &proof) {
+        return Err(JsError::new("internal error: proof failed to verify"));
+    }
+
+    let mut out = serde_json::json!({
+        "root": hex0x(groth16::fr_be32(&root)),
+        "nullifiers": nfs.iter().map(|f| hex0x(groth16::fr_be32(f))).collect::<Vec<_>>(),
+        "out_cm1": hex0x(groth16::fr_be32(&out1.commitment())),
+        "out_cm2": hex0x(groth16::fr_be32(&out2.commitment())),
+        "proof": format!("0x{}", groth16::proof_hex(&proof)),
+        "public_inputs": publics_hex(&publics),
+    });
+    if let Some(rv) = p.recipient_view {
+        let blob = encrypt_note(
+            &ViewingPubKey::from_bytes(parse_bytes32(&rv).map_err(err)?),
+            &out1,
+        );
+        out["recipient_blob"] = serde_json::Value::String(format!("0x{}", hex::encode(blob)));
+    }
+    if let Some(sv) = p.self_view {
+        let blob = encrypt_note(
+            &ViewingPubKey::from_bytes(parse_bytes32(&sv).map_err(err)?),
+            &out2,
+        );
+        out["change_blob"] = serde_json::Value::String(format!("0x{}", hex::encode(blob)));
+    }
+    Ok(out.to_string())
+}
+
+/// Prove a 2-in / 2-out private transfer.
+/// Public inputs order: `[root, nf_1, nf_2, out_cm1, out_cm2]`.
+#[wasm_bindgen]
+pub fn transfer_2_proof(pk: &[u8], params_json: &str) -> Result<String, JsError> {
+    transfer_n_proof::<2>(pk, params_json)
+}
+
+/// Prove a 4-in / 2-out private transfer.
+/// Public inputs order: `[root, nf_1, nf_2, nf_3, nf_4, out_cm1, out_cm2]`.
+#[wasm_bindgen]
+pub fn transfer_4_proof(pk: &[u8], params_json: &str) -> Result<String, JsError> {
+    transfer_n_proof::<4>(pk, params_json)
 }

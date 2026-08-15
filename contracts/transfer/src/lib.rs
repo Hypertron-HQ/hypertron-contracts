@@ -9,8 +9,8 @@
 //!   deposit()  -> shield: pull tokens in, prove the note commits to `amount`.
 //!   unshield() -> exit: prove membership + nullifier + `v = amount + change`,
 //!                 pay a public recipient, re-insert the change note.
-//!   transfer() -> fully private note->note: no public address or amount; only
-//!                 nullifier + two output commitments (+ encrypted payloads).
+//!   transfer()   -> fully private 1-in/2-out: no public address or amount.
+//!   transfer_n() -> fully private 2-in or 4-in / 2-out (same two outputs).
 //!
 //! Relayer model: `unshield`/`transfer` require NO auth from the note owner, so
 //! a relayer can submit them and pay fees — the fee payer never links to the
@@ -68,6 +68,8 @@ pub enum Error {
     InvalidAmount = 6,
     UnsupportedLevelClaim = 7,
     RecipientNotAllowed = 8,
+    UnsupportedArity = 9,
+    DuplicateNullifier = 10,
 }
 
 // TTL policy: keep the pool's instance storage alive well past a month so a
@@ -119,12 +121,13 @@ pub struct Unshielded {
     pub change_index: u32,
 }
 
-/// Emitted on a fully-private transfer. Carries the two new commitment indices
-/// and their encrypted payloads so recipients can discover notes by scanning.
+/// Emitted on a fully-private transfer. Carries every spent nullifier, the two
+/// new commitment indices, and their encrypted payloads so recipients can
+/// discover notes by scanning. 1-in `transfer` emits a one-element vector.
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PrivateTransfer {
-    pub nullifier: BytesN<32>,
+    pub nullifiers: Vec<BytesN<32>>,
     pub out_index_1: u32,
     pub out_index_2: u32,
     pub note_1: Bytes,
@@ -149,6 +152,8 @@ pub struct Config {
     pub deposit_vk_id: u32,
     pub unshield_vk_id: u32,
     pub transfer_vk_id: u32,
+    pub transfer_2in_vk_id: u32,
+    pub transfer_4in_vk_id: u32,
     /// Optional exit-time allowlist policy (compliance hook).
     pub compliance: Option<Address>,
 }
@@ -345,7 +350,87 @@ impl TransferContract {
         let out_index_2 = commitment.insert(&out_commitment_2);
         env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
 
-        PrivateTransfer { nullifier, out_index_1, out_index_2, note_1, note_2 }.publish(&env);
+        let mut spent: Vec<BytesN<32>> = Vec::new(&env);
+        spent.push_back(nullifier);
+        PrivateTransfer {
+            nullifiers: spent,
+            out_index_1,
+            out_index_2,
+            note_1,
+            note_2,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    /// Fully-private N-in / 2-out transfer. `nullifiers` must have length 2
+    /// (VK id `transfer_2in_vk_id`) or 4 (`transfer_4in_vk_id`). Rejects spent
+    /// or duplicate nullifiers. Public inputs:
+    /// `[root] ++ nullifiers ++ [out_cm1, out_cm2]`.
+    pub fn transfer_n(
+        env: Env,
+        proof: Bytes,
+        root: BytesN<32>,
+        nullifiers: Vec<BytesN<32>>,
+        out_commitment_1: BytesN<32>,
+        out_commitment_2: BytesN<32>,
+        note_1: Bytes,
+        note_2: Bytes,
+    ) -> Result<(), Error> {
+        let cfg = load_config(&env)?;
+        let n = nullifiers.len();
+        let vk_id = match n {
+            2 => cfg.transfer_2in_vk_id,
+            4 => cfg.transfer_4in_vk_id,
+            _ => return Err(Error::UnsupportedArity),
+        };
+
+        let commitment = CommitmentClient::new(&env, &cfg.commitment);
+        if !commitment.is_known_root(&root) {
+            return Err(Error::UnknownRoot);
+        }
+
+        let registry = NullifierClient::new(&env, &cfg.nullifier);
+        for i in 0..n {
+            let nf = nullifiers.get(i).unwrap();
+            for j in (i + 1)..n {
+                if nf == nullifiers.get(j).unwrap() {
+                    return Err(Error::DuplicateNullifier);
+                }
+            }
+            if registry.is_spent(&nf) {
+                return Err(Error::NullifierAlreadySpent);
+            }
+        }
+
+        let mut public_inputs: Vec<BytesN<32>> = Vec::new(&env);
+        public_inputs.push_back(root.clone());
+        for i in 0..n {
+            public_inputs.push_back(nullifiers.get(i).unwrap());
+        }
+        public_inputs.push_back(out_commitment_1.clone());
+        public_inputs.push_back(out_commitment_2.clone());
+
+        let verifier = VerifierClient::new(&env, &cfg.verifier);
+        if !verifier.verify(&vk_id, &proof, &public_inputs) {
+            return Err(Error::InvalidProof);
+        }
+
+        for i in 0..n {
+            registry.mark_spent(&nullifiers.get(i).unwrap());
+        }
+        let out_index_1 = commitment.insert(&out_commitment_1);
+        let out_index_2 = commitment.insert(&out_commitment_2);
+        env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND);
+
+        PrivateTransfer {
+            nullifiers,
+            out_index_1,
+            out_index_2,
+            note_1,
+            note_2,
+        }
+        .publish(&env);
         Ok(())
     }
 }

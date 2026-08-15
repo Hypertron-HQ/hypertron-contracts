@@ -71,13 +71,13 @@ Current deployment (native XLM SAC). Source of truth:
 
 | Role | Contract ID |
 |---|---|
-| **Pool** | `CCXVZOJB67J7ZBQG2UTZCFJ3ZSAMDLSBB62B7KLZNNLO4WQDD3KX6BYP` |
-| Commitment | `CATYUTIG5MYWEGOOIKG5FU6XLO3YBO5NRGVSW4QQSOYSPRVGCOW3QWSJ` |
-| Nullifier | `CCEAQ5CYOITD6D7JQ5POGOJAJJV2OAYFDVSAOQVAMBW56HW5K2ZT5WAW` |
+| **Pool** | `CB2SVTMGQKQVLUHWC5J7K5NOHPXULWEJL452B457NCRW7OKJ42XSVOLL` |
+| Commitment | `CD7ZZPCQR7DDZHRNRDUFQ5PKSZK3KVPR3HXKO32NR5QNZWNH2ASVCMTQ` |
+| Nullifier | `CCIZPBTVHFO6PCUB7APABIBSIJUUND2WVW6NSA2RBPCEOLUMASKF7KQD` |
 | Verifier | `CCHSL7YSPSCT62DBUSCG4CKBJ2I4U4JSBR4RE3YIEGNSEUYXYY7BDIEP` |
 | Token (XLM SAC) | `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC` |
 
-VK ids: deposit=`1`, unshield=`2`, transfer=`3`.
+VK ids: deposit=`1`, unshield=`2`, transfer=`3`, transfer-2=`4`, transfer-4=`5`.
 
 Keys come from a single-coordinator setup and are suitable only for integration
 testing. Proving keys live under `vk/*.pk.bin` locally and are gitignored; their
@@ -94,7 +94,7 @@ accepts a freshly generated proof from each proving key — a Groth16 pairing
 check cannot pass against an unrelated verifying key, so this establishes the
 on-chain keys without trusting the manifest or its author.
 
-[Pool on Stellar Lab →](https://lab.stellar.org/r/testnet/contract/CCXVZOJB67J7ZBQG2UTZCFJ3ZSAMDLSBB62B7KLZNNLO4WQDD3KX6BYP)
+[Pool on Stellar Lab →](https://lab.stellar.org/r/testnet/contract/CB2SVTMGQKQVLUHWC5J7K5NOHPXULWEJL452B457NCRW7OKJ42XSVOLL)
 
 ## Quick start
 

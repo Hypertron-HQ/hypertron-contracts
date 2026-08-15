@@ -34,18 +34,28 @@ TOKEN="${TOKEN:?set TOKEN to the SAC/token contract id for the pool asset}"
 
 # Directory holding the verifying keys (see docs/CEREMONY.md):
 #   $VK_DIR/deposit.vk.json  $VK_DIR/unshield.vk.json  $VK_DIR/transfer.vk.json
+#   $VK_DIR/transfer-2.vk.json  $VK_DIR/transfer-4.vk.json
 VK_DIR="${VK_DIR:-vk}"
-# GENERATE_KEYS=1 runs a single-coordinator setup from OS entropy for all three
-# circuits. That is stronger than a fixed seed (nothing is reproducible from the
-# repo) but it is NOT a multi-party ceremony: whoever runs it could retain the
-# toxic waste. Mainnet still requires the ceremony in docs/CEREMONY.md.
+# GENERATE_KEYS=1 runs a single-coordinator setup from OS entropy for all five
+# circuits (deposit, unshield, transfer, transfer-2, transfer-4). That is stronger
+# than a fixed seed (nothing is reproducible from the repo) but it is NOT a
+# multi-party ceremony: whoever runs it could retain the toxic waste. Mainnet
+# still requires the ceremony in docs/CEREMONY.md.
 GENERATE_KEYS="${GENERATE_KEYS:-0}"
+# Reuse an already-deployed verifier (register VK 4/5 only; 1-in keys stay).
+# Testnet: VERIFIER=CCHSL7YSPSCT62DBUSCG4CKBJ2I4U4JSBR4RE3YIEGNSEUYXYY7BDIEP
+VERIFIER="${VERIFIER:-}"
+REUSE_VERIFIER="$VERIFIER"
 # COMPLIANCE=1 also deploys hypertron_compliance and wires it into the pool.
 COMPLIANCE="${COMPLIANCE:-0}"
 # Compliance mode: true => denylist (allow unless listed), false => allowlist.
 COMPLIANCE_DEFAULT_ALLOW="${COMPLIANCE_DEFAULT_ALLOW:-true}"
 
-WASM_DIR="target/wasm32v1-none/release"
+if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+  WASM_DIR="$CARGO_TARGET_DIR/wasm32v1-none/release"
+else
+  WASM_DIR="target/wasm32v1-none/release"
+fi
 
 log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 deploy() { # deploy <wasm-name>
@@ -68,17 +78,19 @@ register_vk() { # register_vk <verifier-id> <vk-id> <vk-json-file>
 log "Building contracts (release, wasm32v1-none)"
 cargo build --release --target wasm32v1-none
 
+CIRCUITS=(deposit unshield transfer "transfer-2" "transfer-4")
+
 if [ "$GENERATE_KEYS" = "1" ]; then
   log "GENERATE_KEYS=1: single-coordinator setup from OS entropy into $VK_DIR"
   mkdir -p "$VK_DIR"
-  for c in deposit unshield transfer; do
+  for c in "${CIRCUITS[@]}"; do
     prove setup --circuit "$c" \
       --pk-out "$VK_DIR/$c.pk.bin" --vk-out "$VK_DIR/$c.vk.json" >/dev/null
     echo "  generated $VK_DIR/$c.vk.json"
   done
 fi
 
-for c in deposit unshield transfer; do
+for c in "${CIRCUITS[@]}"; do
   if [ ! -f "$VK_DIR/$c.vk.json" ]; then
     echo "error: missing $VK_DIR/$c.vk.json (see docs/CEREMONY.md, or set GENERATE_KEYS=1)" >&2
     exit 1
@@ -93,7 +105,7 @@ for c in deposit unshield transfer; do
 done
 
 log "Artifact hashes (record these in deployments/*.json)"
-for c in deposit unshield transfer; do
+for c in "${CIRCUITS[@]}"; do
   for f in "$VK_DIR/$c.vk.json" "$VK_DIR/$c.pk.bin"; do
     [ -f "$f" ] && shasum -a 256 "$f"
   done
@@ -103,8 +115,12 @@ log "Deploying commitment"
 COMMITMENT=$(deploy hypertron_commitment); echo "commitment = $COMMITMENT"
 log "Deploying nullifier"
 NULLIFIER=$(deploy hypertron_nullifier);   echo "nullifier  = $NULLIFIER"
-log "Deploying verifier"
-VERIFIER=$(deploy hypertron_verifier);     echo "verifier   = $VERIFIER"
+if [ -n "$VERIFIER" ]; then
+  log "Reusing verifier $VERIFIER"
+else
+  log "Deploying verifier"
+  VERIFIER=$(deploy hypertron_verifier);   echo "verifier   = $VERIFIER"
+fi
 log "Deploying transfer (pool)"
 POOL=$(deploy hypertron_transfer);         echo "pool       = $POOL"
 
@@ -113,14 +129,22 @@ ADMIN=$(stellar keys address "$SOURCE")
 log "Initializing components (authority = pool, admin = $ADMIN)"
 invoke "$COMMITMENT" initialize --authority "$POOL"
 invoke "$NULLIFIER"  initialize --authority "$POOL"
-invoke "$VERIFIER"   initialize --admin "$ADMIN"
+if [ -z "$REUSE_VERIFIER" ]; then
+  invoke "$VERIFIER" initialize --admin "$ADMIN"
+fi
 
-log "Registering verifying keys (deposit=1, unshield=2, transfer=3)"
-# register_vk encodes each vk.json into the on-chain VerifyingKey struct via the
-# prover's `register-vk-args` helper (single source of truth for the layout).
-register_vk "$VERIFIER" 1 "$VK_DIR/deposit.vk.json"
-register_vk "$VERIFIER" 2 "$VK_DIR/unshield.vk.json"
-register_vk "$VERIFIER" 3 "$VK_DIR/transfer.vk.json"
+if [ -z "$REUSE_VERIFIER" ]; then
+  log "Registering verifying keys (deposit=1, unshield=2, transfer=3, transfer-2=4, transfer-4=5)"
+  register_vk "$VERIFIER" 1 "$VK_DIR/deposit.vk.json"
+  register_vk "$VERIFIER" 2 "$VK_DIR/unshield.vk.json"
+  register_vk "$VERIFIER" 3 "$VK_DIR/transfer.vk.json"
+  register_vk "$VERIFIER" 4 "$VK_DIR/transfer-2.vk.json"
+  register_vk "$VERIFIER" 5 "$VK_DIR/transfer-4.vk.json"
+else
+  log "Registering verifying keys (transfer-2=4, transfer-4=5) on existing verifier"
+  register_vk "$VERIFIER" 4 "$VK_DIR/transfer-2.vk.json"
+  register_vk "$VERIFIER" 5 "$VK_DIR/transfer-4.vk.json"
+fi
 
 COMPLIANCE_ARG="null"
 if [ "$COMPLIANCE" = "1" ]; then
@@ -139,6 +163,8 @@ invoke "$POOL" initialize --config "{
   \"deposit_vk_id\": 1,
   \"unshield_vk_id\": 2,
   \"transfer_vk_id\": 3,
+  \"transfer_2in_vk_id\": 4,
+  \"transfer_4in_vk_id\": 5,
   \"compliance\": $COMPLIANCE_ARG
 }"
 

@@ -4,7 +4,9 @@
 //! Circuits (each needs its own verifying key registered on-chain once):
 //!   - `deposit`   : bind a public shield amount to a note commitment
 //!   - `unshield`  : exit to a public recipient, keeping a change note
-//!   - `transfer`  : fully-private note -> two notes (no public address/amount)
+//!   - `transfer`  : fully-private 1-in / 2-out (no public address/amount)
+//!   - `transfer-2`: fully-private 2-in / 2-out
+//!   - `transfer-4`: fully-private 4-in / 2-out
 //!
 //! Typical flows:
 //!   hypertron-prove setup --circuit unshield        -> pk.bin + vk.json
@@ -24,7 +26,10 @@ use ark_std::rand::{CryptoRng, RngCore};
 use clap::{Parser, Subcommand, ValueEnum};
 use rand_core::OsRng;
 
-use hypertron_prover::circuit::{DepositCircuit, TransferCircuit, UnshieldCircuit};
+use hypertron_prover::circuit::{
+    DepositCircuit, Transfer2Circuit, Transfer4Circuit, TransferCircuit, TransferInput,
+    TransferNCircuit, UnshieldCircuit,
+};
 use hypertron_prover::crypto::{decrypt_note, encrypt_note, ViewingKey, ViewingPubKey};
 use hypertron_prover::note::Note;
 use hypertron_prover::{groth16, merkle, note, parse_bytes32, parse_fr, Fr};
@@ -45,6 +50,10 @@ enum Circuit {
     Deposit,
     Unshield,
     Transfer,
+    #[value(name = "transfer-2")]
+    Transfer2,
+    #[value(name = "transfer-4")]
+    Transfer4,
 }
 
 #[derive(Subcommand)]
@@ -189,6 +198,72 @@ enum Cmd {
         #[arg(long, default_value = "transfer-proof.json")]
         out: PathBuf,
     },
+    /// Prove a 2-in / 2-out private transfer. Repeat `--k`/`--v`/`--index` twice.
+    Transfer2Proof {
+        #[arg(long)]
+        pk: PathBuf,
+        #[arg(long)]
+        spend_sk: String,
+        #[arg(long, required = true)]
+        k: Vec<String>,
+        #[arg(long, required = true)]
+        v: Vec<u128>,
+        #[arg(long, required = true)]
+        index: Vec<usize>,
+        #[arg(long)]
+        leaves: PathBuf,
+        #[arg(long = "out1-owner-pk", visible_alias = "out1-n")]
+        out1_owner_pk: String,
+        #[arg(long)]
+        out1_k: String,
+        #[arg(long)]
+        out1_v: u128,
+        #[arg(long = "out2-owner-pk", visible_alias = "out2-n")]
+        out2_owner_pk: String,
+        #[arg(long)]
+        out2_k: String,
+        #[arg(long)]
+        out2_v: u128,
+        #[arg(long)]
+        recipient_view: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        depth: usize,
+        #[arg(long, default_value = "transfer-2-proof.json")]
+        out: PathBuf,
+    },
+    /// Prove a 4-in / 2-out private transfer. Repeat `--k`/`--v`/`--index` four times.
+    Transfer4Proof {
+        #[arg(long)]
+        pk: PathBuf,
+        #[arg(long)]
+        spend_sk: String,
+        #[arg(long, required = true)]
+        k: Vec<String>,
+        #[arg(long, required = true)]
+        v: Vec<u128>,
+        #[arg(long, required = true)]
+        index: Vec<usize>,
+        #[arg(long)]
+        leaves: PathBuf,
+        #[arg(long = "out1-owner-pk", visible_alias = "out1-n")]
+        out1_owner_pk: String,
+        #[arg(long)]
+        out1_k: String,
+        #[arg(long)]
+        out1_v: u128,
+        #[arg(long = "out2-owner-pk", visible_alias = "out2-n")]
+        out2_owner_pk: String,
+        #[arg(long)]
+        out2_k: String,
+        #[arg(long)]
+        out2_v: u128,
+        #[arg(long)]
+        recipient_view: Option<String>,
+        #[arg(long, default_value_t = 20)]
+        depth: usize,
+        #[arg(long, default_value = "transfer-4-proof.json")]
+        out: PathBuf,
+    },
     /// Encrypt a note to a recipient's viewing pubkey -> on-chain blob (hex).
     Encrypt {
         #[arg(long)]
@@ -214,7 +289,8 @@ enum Cmd {
         /// Path to the verifying-key JSON emitted by `setup`.
         #[arg(long)]
         vk: PathBuf,
-        /// The id to register this key under (deposit=1, unshield=2, transfer=3).
+        /// The id to register this key under (deposit=1, unshield=2, transfer=3,
+        /// transfer-2=4, transfer-4=5).
         #[arg(long)]
         vk_id: u32,
         /// Verifier contract id. If set, also prints the full invoke command.
@@ -271,6 +347,8 @@ fn setup_circuit<R: RngCore + CryptoRng>(
         Circuit::Deposit => groth16::setup(DepositCircuit::empty(), rng)?,
         Circuit::Unshield => groth16::setup(UnshieldCircuit::empty(depth), rng)?,
         Circuit::Transfer => groth16::setup(TransferCircuit::empty(depth), rng)?,
+        Circuit::Transfer2 => groth16::setup(Transfer2Circuit::empty(depth), rng)?,
+        Circuit::Transfer4 => groth16::setup(Transfer4Circuit::empty(depth), rng)?,
     })
 }
 
@@ -282,6 +360,165 @@ fn write_proof(out: &PathBuf, proof_hex: String, publics: &[Fr]) -> Result<()> {
     let text = serde_json::to_string_pretty(&proof_json)?;
     fs::write(out, &text).with_context(|| format!("writing {}", out.display()))?;
     println!("{text}");
+    Ok(())
+}
+
+fn self_test_transfer_n<const N: usize>(
+    pk: &ark_groth16::ProvingKey<ark_bls12_381::Bls12_381>,
+    spend_sk: Fr,
+    depth: usize,
+) -> Result<(ark_groth16::Proof<ark_bls12_381::Bls12_381>, Vec<Fr>)> {
+    let notes: Vec<Note> = (0..N)
+        .map(|i| {
+            Note::from_spend_key(
+                spend_sk,
+                Fr::from(1 + i as u64),
+                Fr::from(100u64 * (i as u64 + 1)),
+            )
+        })
+        .collect();
+    let leaves: Vec<Fr> = notes.iter().map(|n| n.commitment()).collect();
+    let sum_v: u64 = (0..N).map(|i| 100 * (i as u64 + 1)).sum();
+    let mut inputs: [TransferInput; N] =
+        core::array::from_fn(|_| TransferInput::empty(depth));
+    let mut publics = vec![merkle::path(&leaves, 0, depth).0];
+    for i in 0..N {
+        let (root, siblings, path_bits) = merkle::path(&leaves, i, depth);
+        assert_eq!(root, publics[0]);
+        let nf = notes[i].nullifier(spend_sk);
+        publics.push(nf);
+        inputs[i] = TransferInput {
+            k: Some(notes[i].k),
+            v: Some(notes[i].v),
+            nullifier: Some(nf),
+            siblings: siblings.into_iter().map(Some).collect(),
+            path_bits: path_bits.into_iter().map(Some).collect(),
+        };
+    }
+    let out1 = Note::new(Fr::from(101u64), Fr::from(102u64), Fr::from(sum_v - 7));
+    let out2 = Note::new(Fr::from(201u64), Fr::from(202u64), Fr::from(7u64));
+    publics.push(out1.commitment());
+    publics.push(out2.commitment());
+    let circuit = TransferNCircuit::<N> {
+        root: Some(publics[0]),
+        out_cm1: Some(out1.commitment()),
+        out_cm2: Some(out2.commitment()),
+        spend_sk: Some(spend_sk),
+        inputs,
+        owner_pk1: Some(out1.owner_pk),
+        k1: Some(out1.k),
+        v1: Some(out1.v),
+        owner_pk2: Some(out2.owner_pk),
+        k2: Some(out2.k),
+        v2: Some(out2.v),
+    };
+    let p = groth16::prove(pk, circuit, &mut OsRng)?;
+    Ok((p, publics))
+}
+
+fn prove_transfer_n<const N: usize>(
+    pk: PathBuf,
+    spend_sk: String,
+    k: Vec<String>,
+    v: Vec<u128>,
+    index: Vec<usize>,
+    leaves: PathBuf,
+    out1_owner_pk: String,
+    out1_k: String,
+    out1_v: u128,
+    out2_owner_pk: String,
+    out2_k: String,
+    out2_v: u128,
+    recipient_view: Option<String>,
+    depth: usize,
+    out: PathBuf,
+) -> Result<()> {
+    if k.len() != N || v.len() != N || index.len() != N {
+        return Err(anyhow!(
+            "expected {N} --k, --v, and --index values, got k={} v={} index={}",
+            k.len(),
+            v.len(),
+            index.len()
+        ));
+    }
+    let in_sum: u128 = v.iter().sum();
+    if out1_v + out2_v != in_sum {
+        return Err(anyhow!(
+            "outputs {out1_v}+{out2_v} must equal input sum {in_sum}"
+        ));
+    }
+    let pk = groth16::pk_from_bytes(&fs::read(&pk)?)?;
+    let spend_sk = parse_fr(&spend_sk)?;
+    let leaf_frs = read_leaves(&leaves)?;
+    let mut notes = Vec::with_capacity(N);
+    for i in 0..N {
+        notes.push(Note::from_spend_key(
+            spend_sk,
+            parse_fr(&k[i])?,
+            Fr::from(v[i]),
+        ));
+        if index[i] >= leaf_frs.len() || leaf_frs[index[i]] != notes[i].commitment() {
+            return Err(anyhow!(
+                "leaf at index {} does not match input {}",
+                index[i],
+                i
+            ));
+        }
+    }
+    let mut inputs: [TransferInput; N] =
+        core::array::from_fn(|_| TransferInput::empty(depth));
+    let mut publics = Vec::new();
+    let mut nfs = Vec::new();
+    for i in 0..N {
+        let (root, siblings, path_bits) = merkle::path(&leaf_frs, index[i], depth);
+        if i == 0 {
+            publics.push(root);
+        } else if publics[0] != root {
+            return Err(anyhow!("inputs do not share a Merkle root"));
+        }
+        let nf = notes[i].nullifier(spend_sk);
+        nfs.push(nf);
+        inputs[i] = TransferInput {
+            k: Some(notes[i].k),
+            v: Some(notes[i].v),
+            nullifier: Some(nf),
+            siblings: siblings.into_iter().map(Some).collect(),
+            path_bits: path_bits.into_iter().map(Some).collect(),
+        };
+    }
+    let out1 = Note::new(parse_fr(&out1_owner_pk)?, parse_fr(&out1_k)?, Fr::from(out1_v));
+    let out2 = Note::new(parse_fr(&out2_owner_pk)?, parse_fr(&out2_k)?, Fr::from(out2_v));
+    publics.extend(nfs.iter().copied());
+    publics.push(out1.commitment());
+    publics.push(out2.commitment());
+    let circuit = TransferNCircuit::<N> {
+        root: Some(publics[0]),
+        out_cm1: Some(out1.commitment()),
+        out_cm2: Some(out2.commitment()),
+        spend_sk: Some(spend_sk),
+        inputs,
+        owner_pk1: Some(out1.owner_pk),
+        k1: Some(out1.k),
+        v1: Some(out1.v),
+        owner_pk2: Some(out2.owner_pk),
+        k2: Some(out2.k),
+        v2: Some(out2.v),
+    };
+    let proof = groth16::prove(&pk, circuit, &mut OsRng)?;
+    if !groth16::verify(&pk.vk, &publics, &proof) {
+        return Err(anyhow!("internal error: proof failed to verify"));
+    }
+    println!("root     {}", hex0x(groth16::fr_be32(&publics[0])));
+    for (i, nf) in nfs.iter().enumerate() {
+        println!("nf_{}     {}", i + 1, hex0x(groth16::fr_be32(nf)));
+    }
+    println!("out_cm1  {}", hex0x(groth16::fr_be32(&out1.commitment())));
+    println!("out_cm2  {}", hex0x(groth16::fr_be32(&out2.commitment())));
+    if let Some(rv) = recipient_view {
+        let blob = encrypt_note(&ViewingPubKey::from_bytes(parse_bytes32(&rv)?), &out1);
+        println!("recipient_blob 0x{}", hex::encode(blob));
+    }
+    write_proof(&out, groth16::proof_hex(&proof), &publics)?;
     Ok(())
 }
 
@@ -387,6 +624,8 @@ fn main() -> Result<()> {
                     let p = groth16::prove(&pk, c, &mut OsRng)?;
                     (p, vec![root, nf, out1.commitment(), out2.commitment()])
                 }
+                Circuit::Transfer2 => self_test_transfer_n::<2>(&pk, spend_sk, depth)?,
+                Circuit::Transfer4 => self_test_transfer_n::<4>(&pk, spend_sk, depth)?,
             };
 
             if !groth16::verify(&pk.vk, &publics, &proof) {
@@ -542,6 +781,78 @@ fn main() -> Result<()> {
                 println!("recipient_blob 0x{}", hex::encode(blob));
             }
             write_proof(&out, groth16::proof_hex(&proof), &publics)?;
+        }
+
+        Cmd::Transfer2Proof {
+            pk,
+            spend_sk,
+            k,
+            v,
+            index,
+            leaves,
+            out1_owner_pk,
+            out1_k,
+            out1_v,
+            out2_owner_pk,
+            out2_k,
+            out2_v,
+            recipient_view,
+            depth,
+            out,
+        } => {
+            prove_transfer_n::<2>(
+                pk,
+                spend_sk,
+                k,
+                v,
+                index,
+                leaves,
+                out1_owner_pk,
+                out1_k,
+                out1_v,
+                out2_owner_pk,
+                out2_k,
+                out2_v,
+                recipient_view,
+                depth,
+                out,
+            )?;
+        }
+
+        Cmd::Transfer4Proof {
+            pk,
+            spend_sk,
+            k,
+            v,
+            index,
+            leaves,
+            out1_owner_pk,
+            out1_k,
+            out1_v,
+            out2_owner_pk,
+            out2_k,
+            out2_v,
+            recipient_view,
+            depth,
+            out,
+        } => {
+            prove_transfer_n::<4>(
+                pk,
+                spend_sk,
+                k,
+                v,
+                index,
+                leaves,
+                out1_owner_pk,
+                out1_k,
+                out1_v,
+                out2_owner_pk,
+                out2_k,
+                out2_v,
+                recipient_view,
+                depth,
+                out,
+            )?;
         }
 
         Cmd::Encrypt { recipient_view, owner_pk, k, v } => {

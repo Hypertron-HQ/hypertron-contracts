@@ -44,13 +44,13 @@ echo "manifest $MANIFEST"
 
 echo
 echo "1. artifact integrity"
-for c in deposit unshield transfer; do
+for c in deposit unshield transfer "transfer-2" "transfer-4"; do
   for kind in vk pk; do
     case $kind in
       vk) file="$VK_DIR/$c.vk.json"; field=vk_sha256 ;;
       pk) file="$VK_DIR/$c.pk.bin";  field=pk_sha256 ;;
     esac
-    want=$(jq -r ".artifacts.$c.$field" "$MANIFEST")
+    want=$(jq -r --arg c "$c" --arg f "$field" '.artifacts[$c][$f]' "$MANIFEST")
     if [ ! -f "$file" ]; then
       fail "$file is missing"
     elif [ "$(shasum -a 256 "$file" | cut -d' ' -f1)" = "$want" ]; then
@@ -67,8 +67,8 @@ done
 
 echo
 echo "2. on-chain keys accept proofs from these proving keys"
-for c in deposit unshield transfer; do
-  vk_id=$(jq -r ".artifacts.$c.vk_id" "$MANIFEST")
+for c in deposit unshield transfer "transfer-2" "transfer-4"; do
+  vk_id=$(jq -r --arg c "$c" '.artifacts[$c].vk_id' "$MANIFEST")
   if ! cargo run -q --release -p hypertron-prover -- self-test \
         --circuit "$c" --pk "$VK_DIR/$c.pk.bin" --out "$TMP/$c.json" >/dev/null 2>&1; then
     fail "$c: could not build a self-test proof"

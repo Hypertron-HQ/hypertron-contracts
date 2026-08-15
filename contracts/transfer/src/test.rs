@@ -86,6 +86,8 @@ fn deploy_inner(with_compliance: bool) -> Harness {
         deposit_vk_id: 1,
         unshield_vk_id: 2,
         transfer_vk_id: 3,
+        transfer_2in_vk_id: 4,
+        transfer_4in_vk_id: 5,
         compliance: if with_compliance { Some(compliance_id.clone()) } else { None },
     });
 
@@ -215,6 +217,84 @@ fn private_transfer_spends_and_creates_two_notes() {
         &empty,
     );
     assert!(res.is_err());
+}
+
+#[test]
+fn transfer_n_spends_two_nullifiers() {
+    let h = deploy();
+    let user = Address::generate(&h.env);
+    h.token_admin.mint(&user, &1000);
+    deposit(&h, &user, 100, 1);
+
+    let root = h.commitment.root();
+    let empty = Bytes::new(&h.env);
+    let mut nfs: Vec<BytesN<32>> = Vec::new(&h.env);
+    nfs.push_back(leaf(&h.env, 9));
+    nfs.push_back(leaf(&h.env, 10));
+
+    h.client.transfer_n(
+        &proof(&h.env),
+        &root,
+        &nfs,
+        &leaf(&h.env, 20),
+        &leaf(&h.env, 21),
+        &empty,
+        &empty,
+    );
+    assert_eq!(h.commitment.size(), 3);
+
+    let res = h.client.try_transfer_n(
+        &proof(&h.env),
+        &root,
+        &nfs,
+        &leaf(&h.env, 22),
+        &leaf(&h.env, 23),
+        &empty,
+        &empty,
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn transfer_n_rejects_duplicates_and_bad_arity() {
+    let h = deploy();
+    let user = Address::generate(&h.env);
+    h.token_admin.mint(&user, &1000);
+    deposit(&h, &user, 100, 1);
+
+    let root = h.commitment.root();
+    let empty = Bytes::new(&h.env);
+
+    let mut dup: Vec<BytesN<32>> = Vec::new(&h.env);
+    dup.push_back(leaf(&h.env, 9));
+    dup.push_back(leaf(&h.env, 9));
+    assert!(h
+        .client
+        .try_transfer_n(
+            &proof(&h.env),
+            &root,
+            &dup,
+            &leaf(&h.env, 20),
+            &leaf(&h.env, 21),
+            &empty,
+            &empty,
+        )
+        .is_err());
+
+    let mut one: Vec<BytesN<32>> = Vec::new(&h.env);
+    one.push_back(leaf(&h.env, 11));
+    assert!(h
+        .client
+        .try_transfer_n(
+            &proof(&h.env),
+            &root,
+            &one,
+            &leaf(&h.env, 20),
+            &leaf(&h.env, 21),
+            &empty,
+            &empty,
+        )
+        .is_err());
 }
 
 #[test]
