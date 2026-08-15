@@ -47,16 +47,24 @@ JSON **string** whose fields line up 1:1 with the contract call arguments.
 | `decrypt_note_blob(view_secret, blob)` | no | `{ n, k, v }` |
 | `deposit_proof(pk, params)` | yes | `{ commitment, proof, public_inputs }` |
 | `unshield_proof(pk, params)` | yes | `{ root, nullifier, change_cm, proof, public_inputs }` |
-| `transfer_proof(pk, params)` | yes | `{ root, nullifier, out_cm1, out_cm2, proof, public_inputs, recipient_blob? }` |
+| `transfer_proof(pk, params)` | yes | `{ root, nullifier, out_cm1, out_cm2, proof, public_inputs, recipient_blob?, change_blob? }` |
 
 `params` is a JSON string. See the per-circuit fields:
 
 - **deposit**: `{ n, k, amount, seed? }`
 - **unshield**: `{ n, k, v, index, leaves: ["0x…"], recipient_field, amount, change_n, change_k, depth?, seed? }`
-- **transfer**: `{ n, k, v, index, leaves, out1_n, out1_k, out1_v, out2_n, out2_k, out2_v, recipient_view?, depth?, seed? }`
+- **transfer**: `{ n, k, v, index, leaves, out1_n, out1_k, out1_v, out2_n, out2_k, out2_v, recipient_view?, self_view?, depth?, seed? }`
+
+`recipient_view` encrypts out1 (the recipient's note) into `recipient_blob`;
+`self_view` encrypts out2 (the payer's change note) into `change_blob`, so the
+payer can rediscover their change after a browser wipe. Both blobs are emitted
+on-chain by the transfer contract, so pass both keys for any real transfer.
 
 `recipient_field` is `sha256(xdr(recipient_address))` (32-byte hex) — the same
-value the transfer contract derives on-chain. `leaves` is the ordered list of
+value the transfer contract derives on-chain via `Address::to_xdr`, which
+serializes the full **ScVal**, not the bare `ScAddress`. From JS that is
+`hash(Address.fromString(a).toScVal().toXDR("raw"))`; hashing `toScAddress()`
+omits the 4-byte discriminant and the proof will fail to verify. `leaves` is the ordered list of
 inserted note commitments (from the indexer) used to rebuild the Merkle path.
 
 ## Usage — browser (ESM)

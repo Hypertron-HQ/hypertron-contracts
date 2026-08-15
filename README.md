@@ -46,19 +46,18 @@ Current deployment (native XLM SAC). Source of truth:
 
 | Role | Contract ID |
 |---|---|
-| **Pool** | `CBNJY2ULVHOSHCTA4ZBMCU7AEVZHK4J5D3UEWIRSUYTIAQXZNTYQAMJQ` |
-| Commitment | `CBWKYBMQLK2XE4PPE2RPE6XV6IIZZEWQKUDQMVF4YZPFHIQ4Z3SYUCM5` |
-| Nullifier | `CBSPL5JQCGMUEDIQPI2IIUN3WWTELI3KYNXELJYJBNTCNU5MKBOG3YDH` |
-| Verifier | `CCQTSE4PBIDWRDO6NVAY7BPFW2EFF2STK7IL7MKB7XYJ5GKQCTJPOIFK` |
+| **Pool** | `CCXVZOJB67J7ZBQG2UTZCFJ3ZSAMDLSBB62B7KLZNNLO4WQDD3KX6BYP` |
+| Commitment | `CATYUTIG5MYWEGOOIKG5FU6XLO3YBO5NRGVSW4QQSOYSPRVGCOW3QWSJ` |
+| Nullifier | `CCEAQ5CYOITD6D7JQ5POGOJAJJV2OAYFDVSAOQVAMBW56HW5K2ZT5WAW` |
+| Verifier | `CCHSL7YSPSCT62DBUSCG4CKBJ2I4U4JSBR4RE3YIEGNSEUYXYY7BDIEP` |
 | Token (XLM SAC) | `CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC` |
 
 VK ids: deposit=`1`, unshield=`2`, transfer=`3`.
 
-This deploy used `DEV_SETUP=1` (local deterministic keys). Fine for integration;
-not for real TVL. Proving keys live under `vk/*.pk.bin` locally (gitignored) —
-regenerate with the same setup or host them for the UI.
+This deploy reuses the existing dev-only verifying keys. Fine for integration;
+not for real TVL. Proving keys live under `vk/*.pk.bin` locally (gitignored).
 
-[Pool on Stellar Lab →](https://lab.stellar.org/r/testnet/contract/CBNJY2ULVHOSHCTA4ZBMCU7AEVZHK4J5D3UEWIRSUYTIAQXZNTYQAMJQ)
+[Pool on Stellar Lab →](https://lab.stellar.org/r/testnet/contract/CCXVZOJB67J7ZBQG2UTZCFJ3ZSAMDLSBB62B7KLZNNLO4WQDD3KX6BYP)
 
 ## Quick start
 

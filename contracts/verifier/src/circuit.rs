@@ -78,7 +78,8 @@ fn real_unshield_proof_verifies_on_chain() {
     env.cost_estimate().budget().reset_unlimited();
 
     // Value-committed note worth 1000, inserted into the on-chain tree.
-    let input = Note::new(Fr::from(11111u64), Fr::from(22222u64), Fr::from(1000u64));
+    let input_spend_sk = Fr::from(11111u64);
+    let input = Note::from_spend_key(input_spend_sk, Fr::from(22222u64), Fr::from(1000u64));
     let leaf = input.commitment();
 
     let commitment_id = env.register(hypertron_commitment::CommitmentContract, ());
@@ -91,10 +92,10 @@ fn real_unshield_proof_verifies_on_chain() {
     let (root_off, siblings, path_bits) = merkle::path(&[leaf], 0, DEPTH);
     assert_eq!(root_off, root, "off-chain root must equal on-chain root");
 
-    let nf = input.nullifier();
+    let nf = input.nullifier(input_spend_sk);
     let recipient_fe = Fr::from(0xC0FFEEu64);
     let amount = Fr::from(700u64);
-    let change = Note::new(Fr::from(9u64), Fr::from(10u64), Fr::from(300u64));
+    let change = Note::from_spend_key(input_spend_sk, Fr::from(10u64), Fr::from(300u64));
     let change_cm = change.commitment();
 
     let (pk, vk) = groth16::setup(UnshieldCircuit::empty(DEPTH), 7).unwrap();
@@ -104,12 +105,11 @@ fn real_unshield_proof_verifies_on_chain() {
         recipient: Some(recipient_fe),
         amount: Some(amount),
         change_cm: Some(change_cm),
-        n: Some(input.n),
+        spend_sk: Some(input_spend_sk),
         k: Some(input.k),
         v: Some(input.v),
         siblings: siblings.into_iter().map(Some).collect(),
         path_bits: path_bits.into_iter().map(Some).collect(),
-        n2: Some(change.n),
         k2: Some(change.k),
         vc: Some(change.v),
     };
@@ -203,10 +203,16 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
     token_admin.mint(&depositor, &10_000);
 
     // ---- 1. Deposit note A worth 100 (value bound by a real deposit proof). --
-    let a = Note::new(Fr::from(424242u64), Fr::from(133742u64), Fr::from(100u64));
+    let a_spend_sk = Fr::from(424242u64);
+    let a = Note::from_spend_key(a_spend_sk, Fr::from(133742u64), Fr::from(100u64));
     let deposit_proof = groth16::prove(
         &deposit_pk,
-        DepositCircuit { cm: Some(a.commitment()), amount: Some(a.v), n: Some(a.n), k: Some(a.k) },
+        DepositCircuit {
+            cm: Some(a.commitment()),
+            amount: Some(a.v),
+            owner_pk: Some(a.owner_pk),
+            k: Some(a.k),
+        },
         11,
     )
     .unwrap();
@@ -225,23 +231,22 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
     let amount: i128 = 60;
     let recipient_bytes = env.crypto().sha256(&recipient.clone().to_xdr(&env)).to_bytes();
     let recipient_fe = bytesn_to_fr(&recipient_bytes);
-    let change = Note::new(Fr::from(5u64), Fr::from(6u64), Fr::from(40u64));
+    let change = Note::from_spend_key(a_spend_sk, Fr::from(6u64), Fr::from(40u64));
 
     let (_r, siblings, path_bits) = merkle::path(&leaves, 0, DEPTH);
     let unshield_proof = groth16::prove(
         &unshield_pk,
         UnshieldCircuit {
             root: Some(root_a),
-            nullifier: Some(a.nullifier()),
+            nullifier: Some(a.nullifier(a_spend_sk)),
             recipient: Some(recipient_fe),
             amount: Some(Fr::from(amount as u64)),
             change_cm: Some(change.commitment()),
-            n: Some(a.n),
+            spend_sk: Some(a_spend_sk),
             k: Some(a.k),
             v: Some(a.v),
             siblings: siblings.into_iter().map(Some).collect(),
             path_bits: path_bits.into_iter().map(Some).collect(),
-            n2: Some(change.n),
             k2: Some(change.k),
             vc: Some(change.v),
         },
@@ -259,7 +264,7 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
     pool.unshield(
         &proof_to_bytes(&env, &unshield_proof),
         &root_a_bytes,
-        &fr_to_bytesn(&env, &a.nullifier()),
+        &fr_to_bytesn(&env, &a.nullifier(a_spend_sk)),
         &recipient,
         &amount,
         &fr_to_bytesn(&env, &change.commitment()),
@@ -271,10 +276,16 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
     assert_eq!(tree.size(), 2);
 
     // ---- 3. Deposit note B worth 100, then privately transfer it. -----------
-    let b = Note::new(Fr::from(777u64), Fr::from(888u64), Fr::from(100u64));
+    let b_spend_sk = Fr::from(777u64);
+    let b = Note::from_spend_key(b_spend_sk, Fr::from(888u64), Fr::from(100u64));
     let deposit_b = groth16::prove(
         &deposit_pk,
-        DepositCircuit { cm: Some(b.commitment()), amount: Some(b.v), n: Some(b.n), k: Some(b.k) },
+        DepositCircuit {
+            cm: Some(b.commitment()),
+            amount: Some(b.v),
+            owner_pk: Some(b.owner_pk),
+            k: Some(b.k),
+        },
         13,
     )
     .unwrap();
@@ -291,18 +302,18 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
         &transfer_pk,
         TransferCircuit {
             root: Some(root_b),
-            nullifier: Some(b.nullifier()),
+            nullifier: Some(b.nullifier(b_spend_sk)),
             out_cm1: Some(out1.commitment()),
             out_cm2: Some(out2.commitment()),
-            n: Some(b.n),
+            spend_sk: Some(b_spend_sk),
             k: Some(b.k),
             v: Some(b.v),
             siblings: sib_b.into_iter().map(Some).collect(),
             path_bits: bits_b.into_iter().map(Some).collect(),
-            n1: Some(out1.n),
+            owner_pk1: Some(out1.owner_pk),
             k1: Some(out1.k),
             v1: Some(out1.v),
-            n2: Some(out2.n),
+            owner_pk2: Some(out2.owner_pk),
             k2: Some(out2.k),
             v2: Some(out2.v),
         },
@@ -314,7 +325,7 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
     pool.transfer(
         &proof_to_bytes(&env, &transfer_proof),
         &root_b_bytes,
-        &fr_to_bytesn(&env, &b.nullifier()),
+        &fr_to_bytesn(&env, &b.nullifier(b_spend_sk)),
         &fr_to_bytesn(&env, &out1.commitment()),
         &fr_to_bytesn(&env, &out2.commitment()),
         &empty,
@@ -331,7 +342,7 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
     let bad = pool.try_transfer(
         &proof_to_bytes(&env, &transfer_proof),
         &root_b_bytes,
-        &fr_to_bytesn(&env, &b.nullifier()),
+        &fr_to_bytesn(&env, &b.nullifier(b_spend_sk)),
         &fr_to_bytesn(&env, &out1.commitment()),
         &fr_to_bytesn(&env, &out2.commitment()),
         &empty,

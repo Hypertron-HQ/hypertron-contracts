@@ -18,6 +18,14 @@ pub fn zeros(depth: usize) -> Vec<Fr> {
     z
 }
 
+/// Root of the tree over `leaves` (empty → all-zero subtree root at `depth`).
+pub fn root(leaves: &[Fr], depth: usize) -> Fr {
+    if leaves.is_empty() {
+        return zeros(depth)[depth];
+    }
+    path(leaves, 0, depth).0
+}
+
 /// Reconstruct the root and the authentication path for the leaf at `index`,
 /// given the ordered list of currently-inserted `leaves` (unfilled positions
 /// are the empty leaf = 0). Mirrors the on-chain incremental tree exactly.

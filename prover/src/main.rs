@@ -8,7 +8,7 @@
 //!
 //! Typical flows:
 //!   hypertron-prove setup --circuit unshield        -> pk.bin + vk.json
-//!   hypertron-prove commitment --n .. --k .. --v ..  -> leaf to deposit
+//!   hypertron-prove commitment --owner-pk .. --k .. --v ..  -> leaf to deposit
 //!   hypertron-prove deposit-proof ...                -> proof for `deposit`
 //!   hypertron-prove unshield-proof ...               -> proof for `unshield`
 //!   hypertron-prove transfer-proof ...               -> proof + recipient blob
@@ -63,19 +63,22 @@ enum Cmd {
         #[arg(long, default_value = "vk.json")]
         vk_out: PathBuf,
     },
-    /// Compute a note commitment `cm = Poseidon(Poseidon(n,k), v)`.
+    /// Compute a note commitment `cm = Poseidon(Poseidon(owner_pk, k), v)`.
     Commitment {
-        #[arg(long)]
-        n: String,
+        /// Owner public key (`Poseidon(spend_sk, 0)`). Alias: `--n`.
+        #[arg(long = "owner-pk", visible_alias = "n")]
+        owner_pk: String,
         #[arg(long)]
         k: String,
         #[arg(long)]
         v: u128,
     },
-    /// Compute `nullifier = Poseidon(n, 0)`.
+    /// Compute `nullifier = Poseidon(spend_sk, k)`.
     Nullifier {
         #[arg(long)]
-        n: String,
+        spend_sk: String,
+        #[arg(long)]
+        k: String,
     },
     /// Generate a viewing keypair (read-only disclosure authority).
     Keygen {
@@ -87,8 +90,9 @@ enum Cmd {
     DepositProof {
         #[arg(long)]
         pk: PathBuf,
-        #[arg(long)]
-        n: String,
+        /// Owner public key for the deposited note. Alias: `--n`.
+        #[arg(long = "owner-pk", visible_alias = "n")]
+        owner_pk: String,
         #[arg(long)]
         k: String,
         #[arg(long)]
@@ -102,8 +106,9 @@ enum Cmd {
     UnshieldProof {
         #[arg(long)]
         pk: PathBuf,
+        /// Spend secret key for the input note (and change note, same owner).
         #[arg(long)]
-        n: String,
+        spend_sk: String,
         #[arg(long)]
         k: String,
         /// Value of the note being spent.
@@ -119,9 +124,7 @@ enum Cmd {
         /// Amount leaving the pool (must be <= v).
         #[arg(long)]
         amount: u128,
-        /// Change note secrets (receives v - amount, kept in the pool).
-        #[arg(long)]
-        change_n: String,
+        /// Blinding for the change note (same owner as input).
         #[arg(long)]
         change_k: String,
         #[arg(long, default_value_t = 20)]
@@ -135,8 +138,9 @@ enum Cmd {
     TransferProof {
         #[arg(long)]
         pk: PathBuf,
+        /// Spend secret key for the input note.
         #[arg(long)]
-        n: String,
+        spend_sk: String,
         #[arg(long)]
         k: String,
         #[arg(long)]
@@ -145,16 +149,16 @@ enum Cmd {
         index: usize,
         #[arg(long)]
         leaves: PathBuf,
-        /// Output note 1 (to the recipient).
-        #[arg(long)]
-        out1_n: String,
+        /// Output note 1 owner_pk (recipient). Alias: `--out1-n`.
+        #[arg(long = "out1-owner-pk", visible_alias = "out1-n")]
+        out1_owner_pk: String,
         #[arg(long)]
         out1_k: String,
         #[arg(long)]
         out1_v: u128,
-        /// Output note 2 (change back to sender).
-        #[arg(long)]
-        out2_n: String,
+        /// Output note 2 owner_pk (change). Alias: `--out2-n`.
+        #[arg(long = "out2-owner-pk", visible_alias = "out2-n")]
+        out2_owner_pk: String,
         #[arg(long)]
         out2_k: String,
         #[arg(long)]
@@ -173,8 +177,9 @@ enum Cmd {
     Encrypt {
         #[arg(long)]
         recipient_view: String,
-        #[arg(long)]
-        n: String,
+        /// Owner public key. Alias: `--n`.
+        #[arg(long = "owner-pk", visible_alias = "n")]
+        owner_pk: String,
         #[arg(long)]
         k: String,
         #[arg(long)]
@@ -271,13 +276,13 @@ fn main() -> Result<()> {
             println!("{vk_json}");
         }
 
-        Cmd::Commitment { n, k, v } => {
-            let cm = note::commitment(parse_fr(&n)?, parse_fr(&k)?, Fr::from(v));
+        Cmd::Commitment { owner_pk, k, v } => {
+            let cm = note::commitment(parse_fr(&owner_pk)?, parse_fr(&k)?, Fr::from(v));
             println!("{}", hex0x(groth16::fr_be32(&cm)));
         }
 
-        Cmd::Nullifier { n } => {
-            let nf = note::nullifier(parse_fr(&n)?);
+        Cmd::Nullifier { spend_sk, k } => {
+            let nf = note::nullifier(parse_fr(&spend_sk)?, parse_fr(&k)?);
             println!("{}", hex0x(groth16::fr_be32(&nf)));
         }
 
@@ -290,12 +295,17 @@ fn main() -> Result<()> {
             println!("view_pub    0x{}", hex::encode(vk.public().to_bytes()));
         }
 
-        Cmd::DepositProof { pk, n, k, amount, seed, out } => {
+        Cmd::DepositProof { pk, owner_pk, k, amount, seed, out } => {
             let pk = groth16::pk_from_bytes(&fs::read(&pk)?)?;
-            let (n, k) = (parse_fr(&n)?, parse_fr(&k)?);
+            let (owner_pk, k) = (parse_fr(&owner_pk)?, parse_fr(&k)?);
             let amount_fe = Fr::from(amount);
-            let cm = note::commitment(n, k, amount_fe);
-            let circuit = DepositCircuit { cm: Some(cm), amount: Some(amount_fe), n: Some(n), k: Some(k) };
+            let cm = note::commitment(owner_pk, k, amount_fe);
+            let circuit = DepositCircuit {
+                cm: Some(cm),
+                amount: Some(amount_fe),
+                owner_pk: Some(owner_pk),
+                k: Some(k),
+            };
             let proof = groth16::prove(&pk, circuit, seed)?;
             let publics = [cm, amount_fe];
             if !groth16::verify(&pk.vk, &publics, &proof) {
@@ -306,23 +316,25 @@ fn main() -> Result<()> {
         }
 
         Cmd::UnshieldProof {
-            pk, n, k, v, index, leaves, recipient_field, amount, change_n, change_k, depth, seed, out,
+            pk, spend_sk, k, v, index, leaves, recipient_field, amount, change_k, depth, seed, out,
         } => {
             let pk = groth16::pk_from_bytes(&fs::read(&pk)?)?;
-            let (n, k) = (parse_fr(&n)?, parse_fr(&k)?);
+            let spend_sk = parse_fr(&spend_sk)?;
+            let k = parse_fr(&k)?;
             if amount > v {
                 return Err(anyhow!("amount {amount} exceeds note value {v}"));
             }
-            let note_in = Note::new(n, k, Fr::from(v));
+            let note_in = Note::from_spend_key(spend_sk, k, Fr::from(v));
             let leaf_frs = read_leaves(&leaves)?;
             if index >= leaf_frs.len() || leaf_frs[index] != note_in.commitment() {
                 return Err(anyhow!("leaf at index {index} does not match this note"));
             }
             let (root, siblings, path_bits) = merkle::path(&leaf_frs, index, depth);
-            let nf = note_in.nullifier();
+            let nf = note_in.nullifier(spend_sk);
             let recipient_fe = Fr::from_be_bytes_mod_order(&parse_bytes32(&recipient_field)?);
             let amount_fe = Fr::from(amount);
-            let change = Note::new(parse_fr(&change_n)?, parse_fr(&change_k)?, Fr::from(v - amount));
+            let change =
+                Note::from_spend_key(spend_sk, parse_fr(&change_k)?, Fr::from(v - amount));
             let change_cm = change.commitment();
 
             let circuit = UnshieldCircuit {
@@ -331,12 +343,11 @@ fn main() -> Result<()> {
                 recipient: Some(recipient_fe),
                 amount: Some(amount_fe),
                 change_cm: Some(change_cm),
-                n: Some(n),
+                spend_sk: Some(spend_sk),
                 k: Some(k),
                 v: Some(note_in.v),
                 siblings: siblings.into_iter().map(Some).collect(),
                 path_bits: path_bits.into_iter().map(Some).collect(),
-                n2: Some(change.n),
                 k2: Some(change.k),
                 vc: Some(change.v),
             };
@@ -351,11 +362,26 @@ fn main() -> Result<()> {
         }
 
         Cmd::TransferProof {
-            pk, n, k, v, index, leaves, out1_n, out1_k, out1_v, out2_n, out2_k, out2_v,
-            recipient_view, depth, seed, out,
+            pk,
+            spend_sk,
+            k,
+            v,
+            index,
+            leaves,
+            out1_owner_pk,
+            out1_k,
+            out1_v,
+            out2_owner_pk,
+            out2_k,
+            out2_v,
+            recipient_view,
+            depth,
+            seed,
+            out,
         } => {
             let pk = groth16::pk_from_bytes(&fs::read(&pk)?)?;
-            let note_in = Note::new(parse_fr(&n)?, parse_fr(&k)?, Fr::from(v));
+            let spend_sk = parse_fr(&spend_sk)?;
+            let note_in = Note::from_spend_key(spend_sk, parse_fr(&k)?, Fr::from(v));
             if out1_v + out2_v != v {
                 return Err(anyhow!("outputs {out1_v}+{out2_v} must equal input {v}"));
             }
@@ -364,24 +390,24 @@ fn main() -> Result<()> {
                 return Err(anyhow!("leaf at index {index} does not match this note"));
             }
             let (root, siblings, path_bits) = merkle::path(&leaf_frs, index, depth);
-            let nf = note_in.nullifier();
-            let out1 = Note::new(parse_fr(&out1_n)?, parse_fr(&out1_k)?, Fr::from(out1_v));
-            let out2 = Note::new(parse_fr(&out2_n)?, parse_fr(&out2_k)?, Fr::from(out2_v));
+            let nf = note_in.nullifier(spend_sk);
+            let out1 = Note::new(parse_fr(&out1_owner_pk)?, parse_fr(&out1_k)?, Fr::from(out1_v));
+            let out2 = Note::new(parse_fr(&out2_owner_pk)?, parse_fr(&out2_k)?, Fr::from(out2_v));
 
             let circuit = TransferCircuit {
                 root: Some(root),
                 nullifier: Some(nf),
                 out_cm1: Some(out1.commitment()),
                 out_cm2: Some(out2.commitment()),
-                n: Some(note_in.n),
+                spend_sk: Some(spend_sk),
                 k: Some(note_in.k),
                 v: Some(note_in.v),
                 siblings: siblings.into_iter().map(Some).collect(),
                 path_bits: path_bits.into_iter().map(Some).collect(),
-                n1: Some(out1.n),
+                owner_pk1: Some(out1.owner_pk),
                 k1: Some(out1.k),
                 v1: Some(out1.v),
-                n2: Some(out2.n),
+                owner_pk2: Some(out2.owner_pk),
                 k2: Some(out2.k),
                 v2: Some(out2.v),
             };
@@ -400,9 +426,9 @@ fn main() -> Result<()> {
             write_proof(&out, groth16::proof_hex(&proof), &publics)?;
         }
 
-        Cmd::Encrypt { recipient_view, n, k, v } => {
+        Cmd::Encrypt { recipient_view, owner_pk, k, v } => {
             let recip = ViewingPubKey::from_bytes(parse_bytes32(&recipient_view)?);
-            let note = Note::new(parse_fr(&n)?, parse_fr(&k)?, Fr::from(v));
+            let note = Note::new(parse_fr(&owner_pk)?, parse_fr(&k)?, Fr::from(v));
             println!("0x{}", hex::encode(encrypt_note(&recip, &note)));
         }
 
@@ -410,7 +436,7 @@ fn main() -> Result<()> {
             let vk = ViewingKey::from_seed(parse_bytes32(&view_secret)?);
             let blob = hex::decode(blob.trim().strip_prefix("0x").unwrap_or(blob.trim()))?;
             let note = decrypt_note(&vk, &blob)?;
-            println!("n 0x{}", hex::encode(groth16::fr_be32(&note.n)));
+            println!("owner_pk 0x{}", hex::encode(groth16::fr_be32(&note.owner_pk)));
             println!("k 0x{}", hex::encode(groth16::fr_be32(&note.k)));
             println!("v {}", note.v);
         }
