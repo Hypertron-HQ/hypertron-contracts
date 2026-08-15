@@ -20,7 +20,9 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use ark_ff::PrimeField;
+use ark_std::rand::{CryptoRng, RngCore};
 use clap::{Parser, Subcommand, ValueEnum};
+use rand_core::OsRng;
 
 use hypertron_prover::circuit::{DepositCircuit, TransferCircuit, UnshieldCircuit};
 use hypertron_prover::crypto::{decrypt_note, encrypt_note, ViewingKey, ViewingPubKey};
@@ -49,19 +51,39 @@ enum Circuit {
 enum Cmd {
     /// Groth16 setup for one circuit: writes a proving key and a vk JSON.
     ///
-    /// LOCAL, deterministic setup for dev/test. Production requires the
-    /// coordinator/MPC ceremony described in `docs/ceremony.md`.
+    /// Draws setup randomness from the OS CSPRNG. This is a single-coordinator
+    /// setup, not a multi-party ceremony: whoever runs it could retain the toxic
+    /// waste. Production requires the ceremony in `docs/CEREMONY.md`.
     Setup {
         #[arg(long, value_enum)]
         circuit: Circuit,
         #[arg(long, default_value_t = 20)]
         depth: usize,
-        #[arg(long, default_value_t = 1)]
-        seed: u64,
+        /// DEV ONLY. Derive setup randomness from a fixed 64-bit seed, producing
+        /// keys whose toxic waste anyone can recover and whose proofs anyone can
+        /// forge. Requires HYPERTRON_INSECURE_DEV_SETUP=1.
+        #[arg(long)]
+        insecure_dev_seed: Option<u64>,
         #[arg(long, default_value = "pk.bin")]
         pk_out: PathBuf,
         #[arg(long, default_value = "vk.json")]
         vk_out: PathBuf,
+    },
+    /// Build a valid proof over a synthetic witness, for checking a deployment.
+    ///
+    /// Feed the output to the on-chain verifier: if it returns true, the key
+    /// registered under that vk_id really is the one this proving key belongs
+    /// to. A Groth16 pairing check cannot pass against an unrelated key, so
+    /// this confirms the deployment without trusting any published hash.
+    SelfTest {
+        #[arg(long, value_enum)]
+        circuit: Circuit,
+        #[arg(long)]
+        pk: PathBuf,
+        #[arg(long, default_value_t = 20)]
+        depth: usize,
+        #[arg(long, default_value = "self-test-proof.json")]
+        out: PathBuf,
     },
     /// Compute a note commitment `cm = Poseidon(Poseidon(owner_pk, k), v)`.
     Commitment {
@@ -97,8 +119,6 @@ enum Cmd {
         k: String,
         #[arg(long)]
         amount: u128,
-        #[arg(long, default_value_t = 1)]
-        seed: u64,
         #[arg(long, default_value = "deposit-proof.json")]
         out: PathBuf,
     },
@@ -129,8 +149,6 @@ enum Cmd {
         change_k: String,
         #[arg(long, default_value_t = 20)]
         depth: usize,
-        #[arg(long, default_value_t = 1)]
-        seed: u64,
         #[arg(long, default_value = "unshield-proof.json")]
         out: PathBuf,
     },
@@ -168,8 +186,6 @@ enum Cmd {
         recipient_view: Option<String>,
         #[arg(long, default_value_t = 20)]
         depth: usize,
-        #[arg(long, default_value_t = 1)]
-        seed: u64,
         #[arg(long, default_value = "transfer-proof.json")]
         out: PathBuf,
     },
@@ -244,6 +260,20 @@ fn read_leaves(path: &PathBuf) -> Result<Vec<Fr>> {
         .collect()
 }
 
+/// Setup dispatch over the circuit enum, generic in the RNG so the caller
+/// chooses between OS entropy and an explicit development seed.
+fn setup_circuit<R: RngCore + CryptoRng>(
+    circuit: Circuit,
+    depth: usize,
+    rng: &mut R,
+) -> Result<groth16::Keys> {
+    Ok(match circuit {
+        Circuit::Deposit => groth16::setup(DepositCircuit::empty(), rng)?,
+        Circuit::Unshield => groth16::setup(UnshieldCircuit::empty(depth), rng)?,
+        Circuit::Transfer => groth16::setup(TransferCircuit::empty(depth), rng)?,
+    })
+}
+
 fn write_proof(out: &PathBuf, proof_hex: String, publics: &[Fr]) -> Result<()> {
     let proof_json = groth16::ProofJson {
         proof: format!("0x{proof_hex}"),
@@ -257,23 +287,112 @@ fn write_proof(out: &PathBuf, proof_hex: String, publics: &[Fr]) -> Result<()> {
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
-        Cmd::Setup { circuit, depth, seed, pk_out, vk_out } => {
-            eprintln!(
-                "warning: local deterministic setup (seed={seed}). Production needs the \
-                 ceremony in docs/ceremony.md."
-            );
-            let (pk, vk) = match circuit {
-                Circuit::Deposit => groth16::setup(DepositCircuit::empty(), seed)?,
-                Circuit::Unshield => groth16::setup(UnshieldCircuit::empty(depth), seed)?,
-                Circuit::Transfer => groth16::setup(TransferCircuit::empty(depth), seed)?,
+        Cmd::Setup { circuit, depth, insecure_dev_seed, pk_out, vk_out } => {
+            let (pk, vk) = match insecure_dev_seed {
+                Some(seed) => {
+                    if std::env::var("HYPERTRON_INSECURE_DEV_SETUP").as_deref() != Ok("1") {
+                        return Err(anyhow!(
+                            "--insecure-dev-seed produces keys whose toxic waste anyone can \
+                             recover; set HYPERTRON_INSECURE_DEV_SETUP=1 to confirm"
+                        ));
+                    }
+                    eprintln!(
+                        "WARNING: insecure development setup (seed={seed}). The toxic waste is \
+                         publicly recoverable and proofs under these keys are forgeable. Never \
+                         use them to secure value."
+                    );
+                    setup_circuit(circuit, depth, &mut groth16::insecure_dev_rng(seed))?
+                }
+                None => {
+                    eprintln!(
+                        "note: single-coordinator setup from OS entropy. This is not a \
+                         multi-party ceremony — whoever runs it could retain the toxic waste. \
+                         See docs/CEREMONY.md."
+                    );
+                    setup_circuit(circuit, depth, &mut OsRng)?
+                }
             };
             fs::write(&pk_out, groth16::pk_to_bytes(&pk)?)
                 .with_context(|| format!("writing {}", pk_out.display()))?;
-            let vk_json = serde_json::to_string_pretty(&groth16::vk_json(&vk))?;
+            let mut vk_json_value = groth16::vk_json(&vk);
+            vk_json_value.insecure_dev_seed = insecure_dev_seed;
+            let vk_json = serde_json::to_string_pretty(&vk_json_value)?;
             fs::write(&vk_out, &vk_json).with_context(|| format!("writing {}", vk_out.display()))?;
             println!("proving key   -> {}", pk_out.display());
             println!("verifying key -> {} (register on-chain)", vk_out.display());
             println!("{vk_json}");
+        }
+
+        Cmd::SelfTest { circuit, pk, depth, out } => {
+            let pk = groth16::pk_from_bytes(&fs::read(&pk)?)?;
+            // Any self-consistent witness proves the point; these values are
+            // arbitrary and correspond to no real note.
+            let spend_sk = Fr::from(20260815u64);
+            let input = Note::from_spend_key(spend_sk, Fr::from(1u64), Fr::from(1000u64));
+            let (root, siblings, path_bits) = merkle::path(&[input.commitment()], 0, depth);
+            let nf = input.nullifier(spend_sk);
+
+            let (proof, publics) = match circuit {
+                Circuit::Deposit => {
+                    let c = DepositCircuit {
+                        cm: Some(input.commitment()),
+                        amount: Some(input.v),
+                        owner_pk: Some(input.owner_pk),
+                        k: Some(input.k),
+                    };
+                    let p = groth16::prove(&pk, c, &mut OsRng)?;
+                    (p, vec![input.commitment(), input.v])
+                }
+                Circuit::Unshield => {
+                    let recipient = Fr::from(0xC0FFEEu64);
+                    let amount = Fr::from(700u64);
+                    let change = Note::from_spend_key(spend_sk, Fr::from(2u64), Fr::from(300u64));
+                    let c = UnshieldCircuit {
+                        root: Some(root),
+                        nullifier: Some(nf),
+                        recipient: Some(recipient),
+                        amount: Some(amount),
+                        change_cm: Some(change.commitment()),
+                        spend_sk: Some(spend_sk),
+                        k: Some(input.k),
+                        v: Some(input.v),
+                        siblings: siblings.into_iter().map(Some).collect(),
+                        path_bits: path_bits.into_iter().map(Some).collect(),
+                        k2: Some(change.k),
+                        vc: Some(change.v),
+                    };
+                    let p = groth16::prove(&pk, c, &mut OsRng)?;
+                    (p, vec![root, nf, recipient, amount, change.commitment()])
+                }
+                Circuit::Transfer => {
+                    let out1 = Note::new(Fr::from(101u64), Fr::from(102u64), Fr::from(600u64));
+                    let out2 = Note::new(Fr::from(201u64), Fr::from(202u64), Fr::from(400u64));
+                    let c = TransferCircuit {
+                        root: Some(root),
+                        nullifier: Some(nf),
+                        out_cm1: Some(out1.commitment()),
+                        out_cm2: Some(out2.commitment()),
+                        spend_sk: Some(spend_sk),
+                        k: Some(input.k),
+                        v: Some(input.v),
+                        siblings: siblings.into_iter().map(Some).collect(),
+                        path_bits: path_bits.into_iter().map(Some).collect(),
+                        owner_pk1: Some(out1.owner_pk),
+                        k1: Some(out1.k),
+                        v1: Some(out1.v),
+                        owner_pk2: Some(out2.owner_pk),
+                        k2: Some(out2.k),
+                        v2: Some(out2.v),
+                    };
+                    let p = groth16::prove(&pk, c, &mut OsRng)?;
+                    (p, vec![root, nf, out1.commitment(), out2.commitment()])
+                }
+            };
+
+            if !groth16::verify(&pk.vk, &publics, &proof) {
+                return Err(anyhow!("internal error: self-test proof failed to verify"));
+            }
+            write_proof(&out, groth16::proof_hex(&proof), &publics)?;
         }
 
         Cmd::Commitment { owner_pk, k, v } => {
@@ -295,7 +414,7 @@ fn main() -> Result<()> {
             println!("view_pub    0x{}", hex::encode(vk.public().to_bytes()));
         }
 
-        Cmd::DepositProof { pk, owner_pk, k, amount, seed, out } => {
+        Cmd::DepositProof { pk, owner_pk, k, amount, out } => {
             let pk = groth16::pk_from_bytes(&fs::read(&pk)?)?;
             let (owner_pk, k) = (parse_fr(&owner_pk)?, parse_fr(&k)?);
             let amount_fe = Fr::from(amount);
@@ -306,7 +425,7 @@ fn main() -> Result<()> {
                 owner_pk: Some(owner_pk),
                 k: Some(k),
             };
-            let proof = groth16::prove(&pk, circuit, seed)?;
+            let proof = groth16::prove(&pk, circuit, &mut OsRng)?;
             let publics = [cm, amount_fe];
             if !groth16::verify(&pk.vk, &publics, &proof) {
                 return Err(anyhow!("internal error: proof failed to verify"));
@@ -316,7 +435,7 @@ fn main() -> Result<()> {
         }
 
         Cmd::UnshieldProof {
-            pk, spend_sk, k, v, index, leaves, recipient_field, amount, change_k, depth, seed, out,
+            pk, spend_sk, k, v, index, leaves, recipient_field, amount, change_k, depth, out,
         } => {
             let pk = groth16::pk_from_bytes(&fs::read(&pk)?)?;
             let spend_sk = parse_fr(&spend_sk)?;
@@ -351,7 +470,7 @@ fn main() -> Result<()> {
                 k2: Some(change.k),
                 vc: Some(change.v),
             };
-            let proof = groth16::prove(&pk, circuit, seed)?;
+            let proof = groth16::prove(&pk, circuit, &mut OsRng)?;
             let publics = [root, nf, recipient_fe, amount_fe, change_cm];
             if !groth16::verify(&pk.vk, &publics, &proof) {
                 return Err(anyhow!("internal error: proof failed to verify"));
@@ -376,7 +495,6 @@ fn main() -> Result<()> {
             out2_v,
             recipient_view,
             depth,
-            seed,
             out,
         } => {
             let pk = groth16::pk_from_bytes(&fs::read(&pk)?)?;
@@ -411,7 +529,7 @@ fn main() -> Result<()> {
                 k2: Some(out2.k),
                 v2: Some(out2.v),
             };
-            let proof = groth16::prove(&pk, circuit, seed)?;
+            let proof = groth16::prove(&pk, circuit, &mut OsRng)?;
             let publics = [root, nf, out1.commitment(), out2.commitment()];
             if !groth16::verify(&pk.vk, &publics, &proof) {
                 return Err(anyhow!("internal error: proof failed to verify"));

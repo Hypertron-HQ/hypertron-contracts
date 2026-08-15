@@ -26,6 +26,7 @@
 
 use ark_bls12_381::Fr;
 use ark_ff::PrimeField;
+use rand_core::OsRng;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 
@@ -56,14 +57,6 @@ fn u128s(s: &str) -> Result<u128, JsError> {
 
 fn hex0x(bytes: [u8; 32]) -> String {
     format!("0x{}", hex::encode(bytes))
-}
-
-/// A fresh 64-bit seed for Groth16 proof randomness (r, s blinders), drawn from
-/// the platform CSPRNG. Deterministic seeds may be passed in via `seed` instead.
-fn random_seed() -> u64 {
-    let mut b = [0u8; 8];
-    getrandom::getrandom(&mut b).expect("getrandom");
-    u64::from_le_bytes(b)
 }
 
 fn leaves_to_fr(leaves: &[String]) -> Result<Vec<Fr>, JsError> {
@@ -178,7 +171,6 @@ struct DepositParams {
     owner_pk: String,
     k: String,
     amount: String,
-    seed: Option<u64>,
 }
 
 /// Prove a shield deposit binds `amount` to a commitment.
@@ -196,7 +188,7 @@ pub fn deposit_proof(pk: &[u8], params_json: &str) -> Result<String, JsError> {
         owner_pk: Some(owner_pk),
         k: Some(k),
     };
-    let proof = groth16::prove(&pk, circuit, p.seed.unwrap_or_else(random_seed)).map_err(err)?;
+    let proof = groth16::prove(&pk, circuit, &mut OsRng).map_err(err)?;
     let publics = [cm, amount_fe];
     if !groth16::verify(&pk.vk, &publics, &proof) {
         return Err(JsError::new("internal error: proof failed to verify"));
@@ -220,7 +212,6 @@ struct UnshieldParams {
     amount: String,
     change_k: String,
     depth: Option<usize>,
-    seed: Option<u64>,
 }
 
 /// Prove an unshield (exit to a public recipient, keep a change note).
@@ -264,7 +255,7 @@ pub fn unshield_proof(pk: &[u8], params_json: &str) -> Result<String, JsError> {
         k2: Some(change.k),
         vc: Some(change.v),
     };
-    let proof = groth16::prove(&pk, circuit, p.seed.unwrap_or_else(random_seed)).map_err(err)?;
+    let proof = groth16::prove(&pk, circuit, &mut OsRng).map_err(err)?;
     let publics = [root, nf, recipient_fe, amount_fe, change_cm];
     if !groth16::verify(&pk.vk, &publics, &proof) {
         return Err(JsError::new("internal error: proof failed to verify"));
@@ -300,7 +291,6 @@ struct TransferParams {
     /// Enables recovery after browser wipe.
     self_view: Option<String>,
     depth: Option<usize>,
-    seed: Option<u64>,
 }
 
 /// Prove a fully-private note -> two notes transfer.
@@ -345,7 +335,7 @@ pub fn transfer_proof(pk: &[u8], params_json: &str) -> Result<String, JsError> {
         k2: Some(out2.k),
         v2: Some(out2.v),
     };
-    let proof = groth16::prove(&pk, circuit, p.seed.unwrap_or_else(random_seed)).map_err(err)?;
+    let proof = groth16::prove(&pk, circuit, &mut OsRng).map_err(err)?;
     let publics = [root, nf, out1.commitment(), out2.commitment()];
     if !groth16::verify(&pk.vk, &publics, &proof) {
         return Err(JsError::new("internal error: proof failed to verify"));

@@ -98,7 +98,8 @@ fn real_unshield_proof_verifies_on_chain() {
     let change = Note::from_spend_key(input_spend_sk, Fr::from(10u64), Fr::from(300u64));
     let change_cm = change.commitment();
 
-    let (pk, vk) = groth16::setup(UnshieldCircuit::empty(DEPTH), 7).unwrap();
+    let (pk, vk) =
+        groth16::setup(UnshieldCircuit::empty(DEPTH), &mut groth16::insecure_dev_rng(7)).unwrap();
     let circuit = UnshieldCircuit {
         root: Some(root),
         nullifier: Some(nf),
@@ -113,7 +114,7 @@ fn real_unshield_proof_verifies_on_chain() {
         k2: Some(change.k),
         vc: Some(change.v),
     };
-    let proof = groth16::prove(&pk, circuit, 7).unwrap();
+    let proof = groth16::prove(&pk, circuit, &mut groth16::insecure_dev_rng(7)).unwrap();
     assert!(groth16::verify(&vk, &[root, nf, recipient_fe, amount, change_cm], &proof));
 
     let verifier_id = env.register(VerifierContract, ());
@@ -176,9 +177,12 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
     NullifierContractClient::new(&env, &nullifier_id).initialize(&transfer_id);
 
     // Three circuits, three verifying keys.
-    let (deposit_pk, deposit_vk) = groth16::setup(DepositCircuit::empty(), 1).unwrap();
-    let (unshield_pk, unshield_vk) = groth16::setup(UnshieldCircuit::empty(DEPTH), 2).unwrap();
-    let (transfer_pk, transfer_vk) = groth16::setup(TransferCircuit::empty(DEPTH), 3).unwrap();
+    let (deposit_pk, deposit_vk) =
+        groth16::setup(DepositCircuit::empty(), &mut groth16::insecure_dev_rng(1)).unwrap();
+    let (unshield_pk, unshield_vk) =
+        groth16::setup(UnshieldCircuit::empty(DEPTH), &mut groth16::insecure_dev_rng(2)).unwrap();
+    let (transfer_pk, transfer_vk) =
+        groth16::setup(TransferCircuit::empty(DEPTH), &mut groth16::insecure_dev_rng(3)).unwrap();
 
     let verifier = VerifierContractClient::new(&env, &verifier_id);
     verifier.initialize(&Address::generate(&env));
@@ -213,7 +217,7 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
             owner_pk: Some(a.owner_pk),
             k: Some(a.k),
         },
-        11,
+        &mut groth16::insecure_dev_rng(11),
     )
     .unwrap();
     pool.deposit(
@@ -250,7 +254,7 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
             k2: Some(change.k),
             vc: Some(change.v),
         },
-        12,
+        &mut groth16::insecure_dev_rng(12),
     )
     .unwrap();
 
@@ -286,7 +290,7 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
             owner_pk: Some(b.owner_pk),
             k: Some(b.k),
         },
-        13,
+        &mut groth16::insecure_dev_rng(13),
     )
     .unwrap();
     pool.deposit(&depositor, &100, &fr_to_bytesn(&env, &b.commitment()), &proof_to_bytes(&env, &deposit_b));
@@ -317,7 +321,7 @@ fn full_shielded_pool_lifecycle_with_real_proofs() {
             k2: Some(out2.k),
             v2: Some(out2.v),
         },
-        14,
+        &mut groth16::insecure_dev_rng(14),
     )
     .unwrap();
 

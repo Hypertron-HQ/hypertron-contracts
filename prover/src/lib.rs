@@ -66,7 +66,8 @@ mod tests {
         let spend_sk = Fr::from(7u64);
         let note = Note::from_spend_key(spend_sk, Fr::from(8u64), Fr::from(500u64));
         let cm = note.commitment();
-        let (pk, vk) = groth16::setup(DepositCircuit::empty(), 3).unwrap();
+        let (pk, vk) = groth16::setup(DepositCircuit::empty(), &mut groth16::insecure_dev_rng(3))
+            .unwrap();
         let proof = groth16::prove(
             &pk,
             DepositCircuit {
@@ -75,7 +76,7 @@ mod tests {
                 owner_pk: Some(note.owner_pk),
                 k: Some(note.k),
             },
-            3,
+            &mut groth16::insecure_dev_rng(3),
         )
         .unwrap();
         assert!(groth16::verify(&vk, &[cm, note.v], &proof));
@@ -95,7 +96,9 @@ mod tests {
         let change_v = Fr::from(300u64);
         let change_cm = commitment(owner_pk(spend_sk), change_k, change_v);
 
-        let (pk, vk) = groth16::setup(UnshieldCircuit::empty(DEPTH), 3).unwrap();
+        let (pk, vk) =
+            groth16::setup(UnshieldCircuit::empty(DEPTH), &mut groth16::insecure_dev_rng(3))
+                .unwrap();
         let proof = groth16::prove(
             &pk,
             UnshieldCircuit {
@@ -112,7 +115,7 @@ mod tests {
                 k2: Some(change_k),
                 vc: Some(change_v),
             },
-            3,
+            &mut groth16::insecure_dev_rng(3),
         )
         .unwrap();
         assert!(groth16::verify(&vk, &[root, nf, recipient, amount, change_cm], &proof));
@@ -130,7 +133,9 @@ mod tests {
         let to = Note::new(recip_pk, Fr::from(22u64), Fr::from(600u64));
         let change = Note::from_spend_key(spend_sk, Fr::from(32u64), Fr::from(400u64));
 
-        let (pk, vk) = groth16::setup(TransferCircuit::empty(DEPTH), 3).unwrap();
+        let (pk, vk) =
+            groth16::setup(TransferCircuit::empty(DEPTH), &mut groth16::insecure_dev_rng(3))
+                .unwrap();
         let proof = groth16::prove(
             &pk,
             TransferCircuit {
@@ -150,7 +155,7 @@ mod tests {
                 k2: Some(change.k),
                 v2: Some(change.v),
             },
-            3,
+            &mut groth16::insecure_dev_rng(3),
         )
         .unwrap();
         assert!(groth16::verify(

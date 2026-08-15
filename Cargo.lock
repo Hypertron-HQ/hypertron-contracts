@@ -1052,6 +1052,7 @@ dependencies = [
  "getrandom",
  "hex",
  "hypertron-prover",
+ "rand_core",
  "serde",
  "serde_json",
  "wasm-bindgen",

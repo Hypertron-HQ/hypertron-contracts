@@ -17,7 +17,43 @@
     "unshield": 2,
     "transfer": 3
   },
-  "setup": "Dev setup after spend/view key split (owner_pk + nf=Poseidon(spend_sk,k)). Not for production TVL.",
+  "setup": {
+    "kind": "single-coordinator",
+    "randomness": "OS CSPRNG (rand_core::OsRng); no seed material exists on disk",
+    "rotated_at": "2026-08-15",
+    "trust_assumption": "The coordinator who ran the setup could have retained the toxic waste and could forge proofs. This is NOT a multi-party ceremony. Mainnet requires the ceremony in docs/CEREMONY.md plus an external audit.",
+    "supersedes": "Keys generated before 2026-08-15 came from the public seed 1. Their toxic waste was reproducible by anyone from the repository, so proofs under them were forgeable by anyone. Those keys are retired and no longer registered on-chain."
+  },
+  "artifacts": {
+    "deposit": {
+      "vk_id": 1,
+      "public_inputs": 2,
+      "public_input_order": ["cm", "amount"],
+      "vk_sha256": "b9ee66dbf72e00344543dbfdf961ce0d4fd0a04960a281549c212c40ec276593",
+      "pk_sha256": "e6298d202bc2adfddca71852c0618eee75961414d39a54ccc7046dd26599e74c",
+      "registered_tx": "d4c418d5a03829e969454197d5beea10eedf51ee47b00d52f04d97d89d1b64f1"
+    },
+    "unshield": {
+      "vk_id": 2,
+      "public_inputs": 5,
+      "public_input_order": ["root", "nullifier", "recipient", "amount", "change_cm"],
+      "vk_sha256": "277fbcda56fb67ed4652a7c9829253a105377e27d3c4cdf272ec39c07e577414",
+      "pk_sha256": "e87b827477da9ba519ee073ad453f87ac19883b9bf249df9db95e68a366a80ae",
+      "registered_tx": "331bf6cac8bf4fc22b268e7f76ab7b196ffc1e42dbf05a972f3c7f3da7e91a87"
+    },
+    "transfer": {
+      "vk_id": 3,
+      "public_inputs": 4,
+      "public_input_order": ["root", "nullifier", "out_cm1", "out_cm2"],
+      "vk_sha256": "2baf06a2ed681b07d864b2ebe686624401c8047bb7a782b31367698647025cbc",
+      "pk_sha256": "93f01949aab2ca60b67b24306d9c9baa1931c351d1e8ca622e13a5ea3046bfa2",
+      "registered_tx": "ae7b17f54cc321816bbae76241ffe807392036201806ecd76aa0afa306e7e21b"
+    }
+  },
+  "verification": {
+    "command": "./scripts/verify_deployment.sh",
+    "note": "Checks that the local artifacts hash to the values above, and that a freshly generated proof from each local proving key is accepted by the deployed verifier. A Groth16 pairing check cannot pass against an unrelated verifying key, so the second check confirms the on-chain keys without trusting this file or its author."
+  },
   "explorer": {
     "pool": "https://lab.stellar.org/r/testnet/contract/CCXVZOJB67J7ZBQG2UTZCFJ3ZSAMDLSBB62B7KLZNNLO4WQDD3KX6BYP"
   }

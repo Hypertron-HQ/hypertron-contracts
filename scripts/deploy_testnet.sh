@@ -6,23 +6,40 @@
 #   - stellar CLI (https://developers.stellar.org/docs/tools/cli)
 #   - an identity funded via friendbot:  stellar keys generate hypertron --network testnet && \
 #       stellar keys fund hypertron --network testnet
-#   - verifying keys produced by the ceremony (see docs/ceremony.md):
+#   - verifying keys (see docs/CEREMONY.md), or GENERATE_KEYS=1 to produce them:
 #       deposit.vk.json, unshield.vk.json, transfer.vk.json
 #
 # This is intentionally explicit rather than clever: each step prints the id it
 # produced so a reviewer can follow the wiring on-chain.
 set -euo pipefail
 
+# DEV_SETUP used to generate keys from a fixed seed whose toxic waste was
+# publicly recoverable. Fail loudly rather than silently doing something else.
+if [ -n "${DEV_SETUP:-}" ]; then
+  cat >&2 <<'EOF'
+error: DEV_SETUP has been removed. It generated keys from a fixed seed (default
+       1), so anyone could reconstruct the toxic waste and forge proofs.
+
+  Use GENERATE_KEYS=1 to run a single-coordinator setup from OS entropy.
+  The deliberately-forgeable path, for local circuit work only, is:
+      HYPERTRON_INSECURE_DEV_SETUP=1 cargo run -p hypertron-prover -- \
+        setup --circuit deposit --insecure-dev-seed 1 ...
+EOF
+  exit 1
+fi
+
 NETWORK="${NETWORK:-testnet}"
 SOURCE="${SOURCE:-hypertron}"          # stellar keys identity name
 TOKEN="${TOKEN:?set TOKEN to the SAC/token contract id for the pool asset}"
 
-# Directory holding the ceremony-produced verifying keys (see docs/ceremony.md):
+# Directory holding the verifying keys (see docs/CEREMONY.md):
 #   $VK_DIR/deposit.vk.json  $VK_DIR/unshield.vk.json  $VK_DIR/transfer.vk.json
 VK_DIR="${VK_DIR:-vk}"
-# DEV_SETUP=1 generates LOCAL, deterministic dev keys instead of requiring a
-# ceremony. NEVER use this for a real deployment — it has a known toxic waste.
-DEV_SETUP="${DEV_SETUP:-0}"
+# GENERATE_KEYS=1 runs a single-coordinator setup from OS entropy for all three
+# circuits. That is stronger than a fixed seed (nothing is reproducible from the
+# repo) but it is NOT a multi-party ceremony: whoever runs it could retain the
+# toxic waste. Mainnet still requires the ceremony in docs/CEREMONY.md.
+GENERATE_KEYS="${GENERATE_KEYS:-0}"
 # COMPLIANCE=1 also deploys hypertron_compliance and wires it into the pool.
 COMPLIANCE="${COMPLIANCE:-0}"
 # Compliance mode: true => denylist (allow unless listed), false => allowlist.
@@ -51,8 +68,8 @@ register_vk() { # register_vk <verifier-id> <vk-id> <vk-json-file>
 log "Building contracts (release, wasm32v1-none)"
 cargo build --release --target wasm32v1-none
 
-if [ "$DEV_SETUP" = "1" ]; then
-  log "DEV_SETUP=1: generating LOCAL dev verifying keys in $VK_DIR (NOT for production)"
+if [ "$GENERATE_KEYS" = "1" ]; then
+  log "GENERATE_KEYS=1: single-coordinator setup from OS entropy into $VK_DIR"
   mkdir -p "$VK_DIR"
   for c in deposit unshield transfer; do
     prove setup --circuit "$c" \
@@ -63,9 +80,23 @@ fi
 
 for c in deposit unshield transfer; do
   if [ ! -f "$VK_DIR/$c.vk.json" ]; then
-    echo "error: missing $VK_DIR/$c.vk.json (run the ceremony in docs/ceremony.md, or set DEV_SETUP=1)" >&2
+    echo "error: missing $VK_DIR/$c.vk.json (see docs/CEREMONY.md, or set GENERATE_KEYS=1)" >&2
     exit 1
   fi
+  # A key produced from a reproducible seed carries this marker. Refuse to
+  # deploy one by accident.
+  if grep -q '"insecure_dev_seed"' "$VK_DIR/$c.vk.json"; then
+    echo "error: $VK_DIR/$c.vk.json was generated from a public development seed;" >&2
+    echo "       its proofs are forgeable. Regenerate with GENERATE_KEYS=1." >&2
+    exit 1
+  fi
+done
+
+log "Artifact hashes (record these in deployments/*.json)"
+for c in deposit unshield transfer; do
+  for f in "$VK_DIR/$c.vk.json" "$VK_DIR/$c.pk.bin"; do
+    [ -f "$f" ] && shasum -a 256 "$f"
+  done
 done
 
 log "Deploying commitment"

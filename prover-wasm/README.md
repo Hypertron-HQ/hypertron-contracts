@@ -28,7 +28,7 @@ cd pkg && npm publish --access public
 
 Proving keys are large (megabytes) and circuit-specific, so they are **not**
 embedded. Fetch the `pk.bin` produced by the trusted-setup ceremony (see
-[`docs/ceremony.md`](../docs/ceremony.md)) and pass its bytes to each proof
+[`docs/CEREMONY.md`](../docs/CEREMONY.md)) and pass its bytes to each proof
 function. Only the small verifying keys live on-chain (registered via
 `register_vk`).
 
@@ -40,25 +40,40 @@ JSON **string** whose fields line up 1:1 with the contract call arguments.
 
 | function | needs pk | returns (parsed JSON) |
 | --- | --- | --- |
-| `commitment(n, k, v)` | no | `"0x…"` note commitment |
-| `nullifier(n)` | no | `"0x…"` nullifier |
+| `owner_pk(spend_sk)` | no | `"0x…"` public owner key |
+| `commitment(owner_pk, k, v)` | no | `"0x…"` note commitment |
+| `nullifier(spend_sk, k)` | no | `"0x…"` nullifier |
+| `merkle_root(leaves_json)` | no | `"0x…"` depth-20 root |
 | `keygen(seed?)` | no | `{ view_secret, view_pub }` |
-| `encrypt_note_blob(view_pub, n, k, v)` | no | `"0x…"` blob |
-| `decrypt_note_blob(view_secret, blob)` | no | `{ n, k, v }` |
+| `encrypt_note_blob(view_pub, owner_pk, k, v)` | no | `"0x…"` blob |
+| `decrypt_note_blob(view_secret, blob)` | no | `{ owner_pk, n, k, v }` |
 | `deposit_proof(pk, params)` | yes | `{ commitment, proof, public_inputs }` |
 | `unshield_proof(pk, params)` | yes | `{ root, nullifier, change_cm, proof, public_inputs }` |
 | `transfer_proof(pk, params)` | yes | `{ root, nullifier, out_cm1, out_cm2, proof, public_inputs, recipient_blob?, change_blob? }` |
 
-`params` is a JSON string. See the per-circuit fields:
+`params` is a JSON string. `spend_sk` is required only for spending proofs and
+is never included in encrypted note blobs:
 
-- **deposit**: `{ n, k, amount, seed? }`
-- **unshield**: `{ n, k, v, index, leaves: ["0x…"], recipient_field, amount, change_n, change_k, depth?, seed? }`
-- **transfer**: `{ n, k, v, index, leaves, out1_n, out1_k, out1_v, out2_n, out2_k, out2_v, recipient_view?, self_view?, depth?, seed? }`
+- **deposit**: `{ owner_pk, k, amount }`
+- **unshield**: `{ spend_sk, k, v, index, leaves: ["0x…"], recipient_field, amount, change_k, depth? }`
+- **transfer**: `{ spend_sk, k, v, index, leaves, out1_owner_pk, out1_k, out1_v, out2_owner_pk, out2_k, out2_v, recipient_view?, self_view?, depth? }`
+
+Proof randomness is drawn from the platform CSPRNG and is not configurable. The
+proof functions previously accepted a `seed`; a fixed seed makes a Groth16 proof
+a deterministic function of its witness, which makes repeat proofs of the same
+statement byte-identical and lets a guessed witness be confirmed by
+recomputation. A `seed` field is now ignored if passed.
+
+Legacy aliases `n`, `out1_n`, and `out2_n` are accepted for compatibility, but
+new integrations should use the explicit owner-key names.
 
 `recipient_view` encrypts out1 (the recipient's note) into `recipient_blob`;
 `self_view` encrypts out2 (the payer's change note) into `change_blob`, so the
 payer can rediscover their change after a browser wipe. Both blobs are emitted
 on-chain by the transfer contract, so pass both keys for any real transfer.
+They are **not** bound by the transfer proof: a submitter can alter or drop
+them without invalidating the proof. Scanners must verify that decrypted notes
+open to the published commitments.
 
 `recipient_field` is `sha256(xdr(recipient_address))` (32-byte hex) — the same
 value the transfer contract derives on-chain via `Address::to_xdr`, which
@@ -77,12 +92,12 @@ await init(); // loads the .wasm; call once
 const pk = new Uint8Array(await (await fetch("/keys/unshield.pk.bin")).arrayBuffer());
 
 const out = JSON.parse(unshield_proof(pk, JSON.stringify({
-  n, k, v: "1000",
+  spend_sk, k, v: "1000",
   index,
   leaves,               // string[] of 0x commitments from the indexer
   recipient_field,      // sha256(xdr(address)) hex
   amount: "700",
-  change_n, change_k,
+  change_k,             // change remains owned by Poseidon(spend_sk, 0)
 })));
 
 // out.proof / out.root / out.nullifier / out.change_cm / out.public_inputs
@@ -97,11 +112,12 @@ const prover = require("@hypertron/prover"); // no init() needed for the node bu
 
 const pk = readFileSync("./keys/transfer.pk.bin");
 const out = JSON.parse(prover.transfer_proof(pk, JSON.stringify({
-  n, k, v: "1000",
+  spend_sk, k, v: "1000",
   index, leaves,
-  out1_n, out1_k, out1_v: "600",
-  out2_n, out2_k, out2_v: "400",
+  out1_owner_pk, out1_k, out1_v: "600",
+  out2_owner_pk, out2_k, out2_v: "400",
   recipient_view, // optional: also returns out.recipient_blob to emit on-chain
+  self_view,      // optional: encrypted payer change for recovery
 })));
 ```
 
